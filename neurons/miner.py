@@ -1,7 +1,5 @@
 """Poker44 miner entrypoint backed by a shared scoring pipeline."""
 
-from __future__ import annotations
-
 import time
 from pathlib import Path
 from typing import Tuple
