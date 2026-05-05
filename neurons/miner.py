@@ -80,8 +80,21 @@ class Miner(BaseMinerNeuron):
             f"miner_doc={repo_root / 'docs' / 'miner.md'}"
         )
 
+    @staticmethod
+    def _caller_hotkey(synapse: DetectionSynapse) -> str:
+        return getattr(getattr(synapse, "dendrite", None), "hotkey", "unknown")
+
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
+        caller = self._caller_hotkey(synapse)
         chunks = [list(chunk or []) for chunk in (synapse.chunks or [])]
+        chunk_sizes = [len(chunk) for chunk in chunks]
+        bt.logging.info(
+            "Validator query received | "
+            f"caller={caller} "
+            f"chunk_count={len(chunks)} "
+            f"chunk_size_range="
+            f"{[min(chunk_sizes), max(chunk_sizes)] if chunk_sizes else [0, 0]}"
+        )
         started = time.perf_counter()
         result = self.scoring_pipeline.score_chunks(chunks)
 
@@ -104,10 +117,23 @@ class Miner(BaseMinerNeuron):
                 f"prediction_preview={synapse.predictions[:5]}"
             )
         bt.logging.info(message)
+        bt.logging.success(
+            "Validator response sent successfully | "
+            f"caller={caller} "
+            f"chunk_count={len(chunks)} "
+            f"response_count={len(result.scores)} "
+            f"elapsed_ms={elapsed_ms:.2f}"
+        )
         return synapse
 
     async def blacklist(self, synapse: DetectionSynapse) -> Tuple[bool, str]:
-        return self.common_blacklist(synapse)
+        blocked, reason = self.common_blacklist(synapse)
+        caller = self._caller_hotkey(synapse)
+        if blocked:
+            bt.logging.warning(
+                f"Blocked miner request | caller={caller} reason={reason}"
+            )
+        return blocked, reason
 
     async def priority(self, synapse: DetectionSynapse) -> float:
         return self.caller_priority(synapse)
