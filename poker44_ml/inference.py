@@ -53,6 +53,7 @@ class HumanBaselineModel:
         q99 = float(self.score_quantiles.get("q99", q95 + 1.0))
         q995 = float(self.score_quantiles.get("q995", q99 + 1.0))
         q999 = float(self.score_quantiles.get("q999", q995 + 1.0))
+        q9995 = float(self.score_quantiles.get("q9995", q999 + 1.0))
 
         if q90 <= q50:
             q90 = q50 + 1.0
@@ -64,6 +65,8 @@ class HumanBaselineModel:
             q995 = q99 + 1e-6
         if q999 <= q995:
             q999 = q995 + 1e-6
+        if q9995 <= q999:
+            q9995 = q999 + 1e-6
 
         if anomaly_score <= q50:
             return 0.0
@@ -75,15 +78,18 @@ class HumanBaselineModel:
             return round(0.10 + 0.10 * self._clamp01(scaled), 6)
         if anomaly_score <= q99:
             scaled = (anomaly_score - q95) / max(q99 - q95, 1e-9)
-            return round(0.20 + 0.12 * self._clamp01(scaled), 6)
+            return round(0.20 + 0.14 * self._clamp01(scaled), 6)
         if anomaly_score <= q995:
             scaled = (anomaly_score - q99) / max(q995 - q99, 1e-9)
-            return round(0.474 + 0.024 * self._clamp01(scaled), 6)
+            return round(0.34 + 0.11 * self._clamp01(scaled), 6)
         if anomaly_score <= q999:
             scaled = (anomaly_score - q995) / max(q999 - q995, 1e-9)
-            return round(0.50 + 0.30 * self._clamp01(scaled), 6)
-        scaled = (anomaly_score - q999) / max(q999 - q995, 1e-9)
-        return round(0.80 + 0.20 * self._clamp01(scaled), 6)
+            return round(0.45 + 0.038 * self._clamp01(scaled), 6)
+        if anomaly_score <= q9995:
+            scaled = (anomaly_score - q999) / max(q9995 - q999, 1e-9)
+            return round(0.488 + 0.011 * self._clamp01(scaled), 6)
+        scaled = (anomaly_score - q9995) / max(q9995 - q999, 1e-9)
+        return round(0.50 + 0.50 * self._clamp01(math.sqrt(max(0.0, scaled))), 6)
 
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:

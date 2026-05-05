@@ -136,6 +136,7 @@ def train_model(args: argparse.Namespace) -> tuple[object, list[str], dict[str, 
             "q99": quantile(training_anomaly_scores, 0.99),
             "q995": quantile(training_anomaly_scores, 0.995),
             "q999": quantile(training_anomaly_scores, 0.999),
+            "q9995": quantile(training_anomaly_scores, 0.9995),
         },
     }
 
