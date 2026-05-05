@@ -79,6 +79,21 @@ class Miner(BaseMinerNeuron):
             "Miner docs available | "
             f"miner_doc={repo_root / 'docs' / 'miner.md'}"
         )
+        bt.logging.info(
+            "Runtime config | "
+            f"max_hands_per_chunk_eval={self.runtime_config.max_hands_per_chunk_eval} "
+            f"query_log_preview={self.runtime_config.query_log_preview} "
+            f"enable_local_model={self.runtime_config.enable_local_model}"
+        )
+        whitelist = sorted(self.validator_hotkey_whitelist)
+        bt.logging.info(
+            "Access policy | "
+            f"force_validator_permit={self.config.blacklist.force_validator_permit} "
+            f"allow_non_registered={self.config.blacklist.allow_non_registered} "
+            f"validator_allowlist_count={len(whitelist)}"
+        )
+        if whitelist:
+            bt.logging.info(f"Validator allowlist={whitelist}")
 
     @staticmethod
     def _caller_hotkey(synapse: DetectionSynapse) -> str:
@@ -95,6 +110,12 @@ class Miner(BaseMinerNeuron):
             f"chunk_size_range="
             f"{[min(chunk_sizes), max(chunk_sizes)] if chunk_sizes else [0, 0]}"
         )
+        if self.runtime_config.query_log_preview:
+            bt.logging.info(
+                "Validator query preview | "
+                f"caller={caller} "
+                f"first_chunk_hand_count={chunk_sizes[0] if chunk_sizes else 0}"
+            )
         started = time.perf_counter()
         result = self.scoring_pipeline.score_chunks(chunks)
 
@@ -117,6 +138,13 @@ class Miner(BaseMinerNeuron):
                 f"prediction_preview={synapse.predictions[:5]}"
             )
         bt.logging.info(message)
+        bt.logging.info(
+            "Validator response details | "
+            f"caller={caller} "
+            f"backend={result.backend} "
+            f"score_range="
+            f"{[min(result.scores), max(result.scores)] if result.scores else [0.0, 0.0]}"
+        )
         bt.logging.success(
             "Validator response sent successfully | "
             f"caller={caller} "
@@ -133,10 +161,19 @@ class Miner(BaseMinerNeuron):
             bt.logging.warning(
                 f"Blocked miner request | caller={caller} reason={reason}"
             )
+        else:
+            bt.logging.info(
+                f"Accepted miner request | caller={caller} reason={reason}"
+            )
         return blocked, reason
 
     async def priority(self, synapse: DetectionSynapse) -> float:
-        return self.caller_priority(synapse)
+        caller = self._caller_hotkey(synapse)
+        priority = self.caller_priority(synapse)
+        bt.logging.debug(
+            f"Assigned caller priority | caller={caller} priority={priority}"
+        )
+        return priority
 
 
 if __name__ == "__main__":
