@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from poker44.miner.config import repository_paths
-from poker44_ml.inference import Poker44Model
+from poker44_ml.inference import HumanBaselineModel
 from training.build_dataset import (
-    DEFAULT_BOT_PATHS,
-    DEFAULT_HUMAN_PATHS,
-    build_training_dataframe,
+    build_human_chunk_rows,
     load_json_or_gz,
-    resolve_existing_path,
+    resolve_human_path,
 )
-from training.evaluate import evaluate_predictions, format_metrics
 
 try:
     import joblib
@@ -22,412 +17,125 @@ except ImportError:  # pragma: no cover - surfaced only in incomplete runtime en
     joblib = None
 
 try:
-    from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.ensemble import (
-        ExtraTreesClassifier,
-        HistGradientBoostingClassifier,
-        VotingClassifier,
-    )
+    from sklearn.ensemble import IsolationForest
     from sklearn.model_selection import train_test_split
 except ImportError:  # pragma: no cover - surfaced only in incomplete runtime envs.
-    CalibratedClassifierCV = None
-    ExtraTreesClassifier = None
-    HistGradientBoostingClassifier = None
-    VotingClassifier = None
+    IsolationForest = None
     train_test_split = None
-
-try:
-    from xgboost import XGBClassifier
-except ImportError:  # pragma: no cover - surfaced only in incomplete runtime envs.
-    XGBClassifier = None
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PATHS = repository_paths(REPO_ROOT)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a fast chunk-level Poker44 miner model."
+        description="Train a human-only Poker44 baseline model."
     )
     parser.add_argument("--human-path", type=str, default=None)
-    parser.add_argument("--bot-path", type=str, default=None)
     parser.add_argument("--chunk-size", type=int, default=80)
     parser.add_argument("--min-chunk-size", type=int, default=40)
+    parser.add_argument("--stride", type=int, default=40)
+    parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-estimators", type=int, default=300)
-    parser.add_argument("--max-depth", type=int, default=5)
-    parser.add_argument("--learning-rate", type=float, default=0.05)
-    parser.add_argument("--subsample", type=float, default=0.9)
-    parser.add_argument("--colsample-bytree", type=float, default=0.9)
-    parser.add_argument(
-        "--calibration",
-        choices=("auto", "isotonic", "sigmoid", "none"),
-        default="auto",
-    )
-    parser.add_argument("--recall-target", type=float, default=0.9)
-    parser.add_argument(
-        "--min-threshold-at-recall",
-        type=float,
-        default=0.0,
-        help="Minimum acceptable threshold_at_recall during model selection.",
-    )
-    parser.add_argument(
-        "--max-fpr-at-threshold-0-5",
-        type=float,
-        default=0.0,
-        help="Constraint used during model selection.",
-    )
-    parser.add_argument(
-        "--max-fpr-at-recall",
-        type=float,
-        default=0.003,
-        help="Constraint used during model selection.",
-    )
-    parser.add_argument(
-        "--search",
-        action="store_true",
-        help="Evaluate multiple candidate configurations and save the best one.",
-    )
-    parser.add_argument(
-        "--search-budget",
-        type=int,
-        default=6,
-        help="Maximum number of base parameter configurations to evaluate in search mode.",
-    )
+    parser.add_argument("--max-samples", type=float, default=0.75)
+    parser.add_argument("--max-features", type=float, default=0.9)
+    parser.add_argument("--bootstrap", action="store_true")
     parser.add_argument(
         "--output",
         type=str,
-        default=str(PATHS.default_model_path),
+        default=str(REPO_ROOT / "models" / "poker44_human_baseline.joblib"),
     )
     return parser.parse_args()
 
 
-def choose_calibration_options(method: str, train_size: int) -> list[str | None]:
-    if method == "none":
-        return [None]
-    if method == "sigmoid":
-        return ["sigmoid"]
-    if method == "isotonic":
-        return ["isotonic"] if train_size >= 800 else ["sigmoid"]
-    options: list[str | None] = ["sigmoid", None]
-    if train_size >= 800:
-        options.insert(1, "isotonic")
-    return options
+def quantile(sorted_values: list[float], q: float) -> float:
+    if not sorted_values:
+        return 0.0
+    q = max(0.0, min(1.0, q))
+    index = q * (len(sorted_values) - 1)
+    lower = int(index)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    fraction = index - lower
+    return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
 
 
-def build_base_model(
-    *,
-    n_estimators: int,
-    max_depth: int,
-    learning_rate: float,
-    subsample: float,
-    colsample_bytree: float,
-    seed: int,
-) -> tuple[object, str]:
-    if XGBClassifier is not None:
-        booster = XGBClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            subsample=subsample,
-            colsample_bytree=colsample_bytree,
-            eval_metric="logloss",
-            random_state=seed,
-            n_jobs=1,
-        )
-        forest = ExtraTreesClassifier(
-            n_estimators=max(200, n_estimators),
-            max_depth=max_depth + 2,
-            min_samples_leaf=2,
-            class_weight="balanced",
-            random_state=seed,
-            n_jobs=1,
-        )
-        return (
-            VotingClassifier(
-                estimators=[("xgb", booster), ("et", forest)],
-                voting="soft",
-                weights=[2, 1],
-            ),
-            "xgboost+extra-trees+sklearn-calibration",
-        )
-
-    booster = HistGradientBoostingClassifier(
-        learning_rate=learning_rate,
-        max_depth=max_depth,
-        max_iter=n_estimators,
-        random_state=seed,
-    )
-    forest = ExtraTreesClassifier(
-        n_estimators=max(300, n_estimators),
-        max_depth=max_depth + 2,
-        min_samples_leaf=2,
-        class_weight="balanced",
-        random_state=seed,
-        n_jobs=1,
-    )
-    return (
-        VotingClassifier(
-            estimators=[("hgb", booster), ("et", forest)],
-            voting="soft",
-            weights=[2, 1],
-        ),
-        "sklearn-hist-gradient-boosting+extra-trees+calibration",
-    )
-
-
-def build_search_configs(args: argparse.Namespace) -> list[dict[str, float | int]]:
-    base = {
-        "n_estimators": args.n_estimators,
-        "max_depth": args.max_depth,
-        "learning_rate": args.learning_rate,
-        "subsample": args.subsample,
-        "colsample_bytree": args.colsample_bytree,
+def validation_metrics(risks: list[float]) -> dict[str, float]:
+    sorted_risks = sorted(float(value) for value in risks)
+    false_positive_at_0_5 = sum(1 for value in sorted_risks if value >= 0.5) / max(len(sorted_risks), 1)
+    false_positive_at_0_75 = sum(1 for value in sorted_risks if value >= 0.75) / max(len(sorted_risks), 1)
+    return {
+        "human_fpr_at_0_5": false_positive_at_0_5,
+        "human_fpr_at_0_75": false_positive_at_0_75,
+        "risk_mean": sum(sorted_risks) / max(len(sorted_risks), 1),
+        "risk_q50": quantile(sorted_risks, 0.50),
+        "risk_q90": quantile(sorted_risks, 0.90),
+        "risk_q95": quantile(sorted_risks, 0.95),
+        "risk_q99": quantile(sorted_risks, 0.99),
+        "risk_max": max(sorted_risks) if sorted_risks else 0.0,
     }
-    candidates = [
-        base,
-        {
-            **base,
-            "n_estimators": max(args.n_estimators, 500),
-            "max_depth": min(args.max_depth, 4),
-            "learning_rate": min(args.learning_rate, 0.03),
-            "subsample": max(args.subsample, 0.95),
-            "colsample_bytree": max(args.colsample_bytree, 0.95),
-        },
-        {
-            **base,
-            "n_estimators": max(args.n_estimators, 700),
-            "max_depth": min(args.max_depth, 4),
-            "learning_rate": min(args.learning_rate, 0.02),
-            "subsample": max(args.subsample, 0.95),
-            "colsample_bytree": max(args.colsample_bytree, 0.95),
-        },
-        {
-            **base,
-            "n_estimators": max(args.n_estimators, 600),
-            "max_depth": 5,
-            "learning_rate": min(args.learning_rate, 0.03),
-        },
-        {
-            **base,
-            "n_estimators": max(args.n_estimators, 900),
-            "max_depth": 3,
-            "learning_rate": min(args.learning_rate, 0.02),
-            "subsample": 1.0,
-            "colsample_bytree": 1.0,
-        },
-        {
-            **base,
-            "n_estimators": max(args.n_estimators, 800),
-            "max_depth": 4,
-            "learning_rate": min(args.learning_rate, 0.025),
-            "subsample": max(args.subsample, 0.95),
-            "colsample_bytree": max(args.colsample_bytree, 0.95),
-        },
-    ]
-    return candidates[: max(1, args.search_budget)]
-
-
-def constraint_status(
-    metrics: dict[str, float],
-    args: argparse.Namespace,
-) -> tuple[bool, float]:
-    violation = 0.0
-    if metrics["threshold_at_recall"] < args.min_threshold_at_recall:
-        violation += (
-            args.min_threshold_at_recall - metrics["threshold_at_recall"]
-        ) * 10.0
-    if metrics["fpr_at_threshold_0_5"] > args.max_fpr_at_threshold_0_5:
-        violation += (
-            metrics["fpr_at_threshold_0_5"] - args.max_fpr_at_threshold_0_5
-        ) * 1000.0
-    if metrics["fpr_at_recall"] > args.max_fpr_at_recall:
-        violation += metrics["fpr_at_recall"] - args.max_fpr_at_recall
-    return violation == 0.0, violation
-
-
-def candidate_rank(
-    metrics: dict[str, float],
-    args: argparse.Namespace,
-) -> tuple[float, ...]:
-    satisfies_constraints, violation = constraint_status(metrics, args)
-    if satisfies_constraints:
-        return (
-            1.0,
-            metrics["achieved_recall"],
-            -metrics["fpr_at_recall"],
-            -metrics["fpr_at_threshold_0_5"],
-            metrics["pr_auc"],
-            metrics["roc_auc"],
-            -metrics["log_loss"],
-        )
-    return (
-        0.0,
-        -violation,
-        -metrics["fpr_at_threshold_0_5"],
-        -metrics["fpr_at_recall"],
-        metrics["achieved_recall"],
-        metrics["pr_auc"],
-        metrics["roc_auc"],
-    )
-
-
-def fit_candidate(
-    *,
-    config: dict[str, float | int],
-    calibration_method: str | None,
-    X_train: list[list[float]],
-    X_test: list[list[float]],
-    y_train: list[int],
-    y_test: list[int],
-    args: argparse.Namespace,
-) -> tuple[object, dict[str, float], dict[str, Any]]:
-    base_model, framework_name = build_base_model(
-        n_estimators=int(config["n_estimators"]),
-        max_depth=int(config["max_depth"]),
-        learning_rate=float(config["learning_rate"]),
-        subsample=float(config["subsample"]),
-        colsample_bytree=float(config["colsample_bytree"]),
-        seed=args.seed,
-    )
-
-    model = base_model
-    if calibration_method is not None:
-        min_class_count = min(Counter(y_train).values())
-        cv = min(3, min_class_count)
-        if cv >= 2:
-            model = CalibratedClassifierCV(
-                base_model,
-                method=calibration_method,
-                cv=cv,
-            )
-
-    model.fit(X_train, y_train)
-    if hasattr(model, "predict_proba"):
-        probs = model.predict_proba(X_test)[:, 1]
-    else:
-        probs = model.predict(X_test)
-
-    metrics = evaluate_predictions(
-        y_true=y_test,
-        y_prob=probs,
-        recall_target=args.recall_target,
-    )
-    metadata = {
-        **config,
-        "framework": framework_name,
-        "calibration": calibration_method or "none",
-    }
-    return model, metrics, metadata
 
 
 def train_model(args: argparse.Namespace) -> tuple[object, list[str], dict[str, float], dict[str, Any]]:
     if joblib is None:
-        raise RuntimeError("Training dependencies are missing. Install joblib first.")
-    if any(
-        dependency is None
-        for dependency in (
-            CalibratedClassifierCV,
-            ExtraTreesClassifier,
-            HistGradientBoostingClassifier,
-            VotingClassifier,
-            train_test_split,
-        )
-    ):
-        raise RuntimeError("scikit-learn is required to train and calibrate the miner model.")
+        raise RuntimeError("joblib is required to save the human baseline model.")
+    if IsolationForest is None or train_test_split is None:
+        raise RuntimeError("scikit-learn is required to train the human baseline model.")
 
-    human_path = resolve_existing_path(args.human_path, DEFAULT_HUMAN_PATHS)
-    bot_path = resolve_existing_path(args.bot_path, DEFAULT_BOT_PATHS)
+    human_path = resolve_human_path(args.human_path)
     human_hands = load_json_or_gz(human_path)
-    bot_hands = load_json_or_gz(bot_path)
-
-    rows = build_training_dataframe(
+    rows = build_human_chunk_rows(
         human_hands=human_hands,
-        bot_hands=bot_hands,
         chunk_size=args.chunk_size,
         min_chunk_size=args.min_chunk_size,
+        stride=args.stride,
+        repeats=args.repeats,
         seed=args.seed,
     )
     if not rows:
-        raise RuntimeError(
-            "Training dataframe is empty. Verify your human/bot hand sources."
-        )
+        raise RuntimeError("No human chunks were generated from the corpus.")
 
-    feature_names = sorted(key for key in rows[0].keys() if key != "label")
+    feature_names = sorted(rows[0].keys())
     X = [[float(row.get(name, 0.0)) for name in feature_names] for row in rows]
-    y = [int(row["label"]) for row in rows]
-
-    X_train, X_test, y_train, y_test = train_test_split(
+    X_train, X_test = train_test_split(
         X,
-        y,
         test_size=args.test_size,
         random_state=args.seed,
-        stratify=y,
     )
 
-    configs = build_search_configs(args) if args.search else [
-        {
-            "n_estimators": args.n_estimators,
-            "max_depth": args.max_depth,
-            "learning_rate": args.learning_rate,
-            "subsample": args.subsample,
-            "colsample_bytree": args.colsample_bytree,
-        }
-    ]
-    calibration_options = choose_calibration_options(args.calibration, len(X_train))
+    model = IsolationForest(
+        n_estimators=args.n_estimators,
+        max_samples=args.max_samples,
+        max_features=args.max_features,
+        bootstrap=args.bootstrap,
+        contamination="auto",
+        random_state=args.seed,
+        n_jobs=1,
+    )
+    model.fit(X_train)
 
-    best_model = None
-    best_metrics: dict[str, float] | None = None
-    best_metadata: dict[str, Any] | None = None
-    best_rank: tuple[float, ...] | None = None
-
-    candidate_index = 0
-    for config in configs:
-        for calibration_method in calibration_options:
-            candidate_index += 1
-            model, metrics, metadata = fit_candidate(
-                config=config,
-                calibration_method=calibration_method,
-                X_train=X_train,
-                X_test=X_test,
-                y_train=y_train,
-                y_test=y_test,
-                args=args,
-            )
-            rank = candidate_rank(metrics, args)
-            satisfies_constraints, violation = constraint_status(metrics, args)
-            print(
-                f"candidate={candidate_index} "
-                f"constraints_ok={int(satisfies_constraints)} "
-                f"constraint_violation={violation:.6f} "
-                f"config={metadata} "
-                f"{format_metrics(metrics)}"
-            )
-            if best_rank is None or rank > best_rank:
-                best_rank = rank
-                best_model = model
-                best_metrics = metrics
-                best_metadata = metadata
-
-    if best_model is None or best_metrics is None or best_metadata is None:
-        raise RuntimeError("No model candidate was trained.")
-
-    artifact_meta = {
-        "chunk_size": float(args.chunk_size),
-        "min_chunk_size": float(args.min_chunk_size),
+    training_anomaly_scores = sorted(-float(value) for value in model.score_samples(X_train))
+    metadata = {
+        "framework": "isolation-forest-human-baseline",
         "human_path": str(human_path),
-        "bot_path": str(bot_path),
         "train_rows": float(len(X_train)),
         "test_rows": float(len(X_test)),
-        "recall_target": float(args.recall_target),
-        "min_threshold_at_recall": float(args.min_threshold_at_recall),
-        "max_fpr_at_threshold_0_5": float(args.max_fpr_at_threshold_0_5),
-        "max_fpr_at_recall": float(args.max_fpr_at_recall),
-        **{
-            key: float(value) if isinstance(value, (int, float)) else value
-            for key, value in best_metadata.items()
+        "chunk_size": float(args.chunk_size),
+        "min_chunk_size": float(args.min_chunk_size),
+        "stride": float(args.stride),
+        "repeats": float(args.repeats),
+        "n_estimators": float(args.n_estimators),
+        "max_samples": float(args.max_samples),
+        "max_features": float(args.max_features),
+        "bootstrap": bool(args.bootstrap),
+        "score_quantiles": {
+            "q50": quantile(training_anomaly_scores, 0.50),
+            "q90": quantile(training_anomaly_scores, 0.90),
+            "q95": quantile(training_anomaly_scores, 0.95),
+            "q99": quantile(training_anomaly_scores, 0.99),
+            "q995": quantile(training_anomaly_scores, 0.995),
+            "q999": quantile(training_anomaly_scores, 0.999),
         },
     }
 
@@ -435,19 +143,27 @@ def train_model(args: argparse.Namespace) -> tuple[object, list[str], dict[str, 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(
         {
-            "model": best_model,
+            "model": model,
             "feature_names": feature_names,
-            "metadata": artifact_meta,
+            "metadata": metadata,
         },
         output_path,
     )
 
-    loaded = Poker44Model(output_path)
+    loaded = HumanBaselineModel(output_path)
+    validation_risks = [-float(value) for value in loaded.model.score_samples(X_test)]
+    validation_human_risks = [
+        loaded._risk_from_anomaly(anomaly_score) for anomaly_score in validation_risks
+    ]
+    metrics = validation_metrics(validation_human_risks)
     latency = loaded.benchmark_latency(
-        [human_hands[: args.chunk_size], bot_hands[: args.chunk_size]]
+        [human_hands[: args.chunk_size], human_hands[args.chunk_size : args.chunk_size * 2]]
     )
-    best_metrics["latency_per_chunk_ms"] = latency["latency_per_chunk_ms"]
-    return best_model, feature_names, best_metrics, artifact_meta
+    metrics["latency_per_chunk_ms"] = latency["latency_per_chunk_ms"]
+    metrics["raw_validation_score_mean"] = (
+        sum(validation_risks) / max(len(validation_risks), 1)
+    )
+    return model, feature_names, metrics, metadata
 
 
 def main() -> None:
@@ -458,12 +174,23 @@ def main() -> None:
     print(
         "Selected config: "
         f"framework={metadata.get('framework')} "
-        f"calibration={metadata.get('calibration')} "
         f"n_estimators={metadata.get('n_estimators')} "
-        f"max_depth={metadata.get('max_depth')} "
-        f"learning_rate={metadata.get('learning_rate')}"
+        f"max_samples={metadata.get('max_samples')} "
+        f"max_features={metadata.get('max_features')} "
+        f"bootstrap={metadata.get('bootstrap')}"
     )
-    print(format_metrics(metrics))
+    for key in (
+        "human_fpr_at_0_5",
+        "human_fpr_at_0_75",
+        "risk_mean",
+        "risk_q50",
+        "risk_q90",
+        "risk_q95",
+        "risk_q99",
+        "risk_max",
+        "latency_per_chunk_ms",
+    ):
+        print(f"{key}={float(metrics.get(key, 0.0)):.6f}")
 
 
 if __name__ == "__main__":

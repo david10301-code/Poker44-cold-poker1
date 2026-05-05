@@ -13,81 +13,85 @@ except ImportError:  # pragma: no cover - surfaced only in incomplete runtime en
     joblib = None
 
 
-class Poker44Model:
-    """Thin runtime wrapper around a pre-trained calibrated classifier."""
+class HumanBaselineModel:
+    """Runtime wrapper for a human-only baseline model."""
 
     def __init__(self, model_path: str | Path):
         if joblib is None:
             raise RuntimeError(
                 "joblib is required to load the Poker44 model artifact. "
-                "Install the training/runtime dependencies first."
+                "Install runtime dependencies first."
             )
 
         self.model_path = Path(model_path)
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model artifact not found: {self.model_path}")
-        if self.model_path.stat().st_size == 0:
-            raise RuntimeError(
-                f"Model artifact is empty: {self.model_path}. "
-                "Generate bot data and retrain the miner model before starting the miner."
-            )
 
         artifact = joblib.load(self.model_path)
-        if isinstance(artifact, dict):
-            self.model = artifact["model"]
-            self.feature_names = list(artifact.get("feature_names") or [])
-            self.metadata = dict(artifact.get("metadata") or {})
-        else:
-            self.model = artifact
-            self.feature_names = []
-            self.metadata = {}
+        self.model = artifact["model"]
+        self.feature_names = list(artifact.get("feature_names") or [])
+        self.metadata = dict(artifact.get("metadata") or {})
+        self.score_quantiles = dict(self.metadata.get("score_quantiles") or {})
 
     def _aligned_rows(self, chunks: list[list[dict[str, Any]]]) -> list[list[float]]:
         rows: list[list[float]] = []
-        
         for chunk in chunks:
             feats = chunk_features(chunk)
-            
-            # If no feature names loaded from artifact, infer from first chunk
             if not self.feature_names:
-                ordered = sorted(feats)
-                self.feature_names = ordered
-                if not self.feature_names:
-                    raise RuntimeError(
-                        f"Failed to extract any features from chunk. "
-                        f"Got empty feature dict: {feats}"
-                    )
-            
-            # Validate that all expected features are present in this chunk
-            # Missing features indicate data corruption or model-data mismatch
-            missing_features = set(self.feature_names) - set(feats.keys())
-            if missing_features:
-                raise RuntimeError(
-                    f"Feature mismatch in chunk inference: "
-                    f"expected {len(self.feature_names)} features ({self.feature_names}), "
-                    f"but missing {len(missing_features)}: {sorted(missing_features)}. "
-                    f"This indicates data formatting or model-training mismatch. "
-                    f"Got features: {sorted(feats.keys())}"
-                )
-            
-            # Align features to training feature order
+                self.feature_names = sorted(feats)
             rows.append([float(feats.get(name, 0.0)) for name in self.feature_names])
-        
         return rows
+
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    def _risk_from_anomaly(self, anomaly_score: float) -> float:
+        q50 = float(self.score_quantiles.get("q50", 0.0))
+        q90 = float(self.score_quantiles.get("q90", q50 + 1.0))
+        q95 = float(self.score_quantiles.get("q95", q50 + 1.0))
+        q99 = float(self.score_quantiles.get("q99", q95 + 1.0))
+        q995 = float(self.score_quantiles.get("q995", q99 + 1.0))
+        q999 = float(self.score_quantiles.get("q999", q995 + 1.0))
+
+        if q90 <= q50:
+            q90 = q50 + 1.0
+        if q95 <= q90:
+            q95 = q90 + 1e-6
+        if q99 <= q95:
+            q99 = q95 + 1e-6
+        if q995 <= q99:
+            q995 = q99 + 1e-6
+        if q999 <= q995:
+            q999 = q995 + 1e-6
+
+        if anomaly_score <= q50:
+            return 0.0
+        if anomaly_score <= q90:
+            scaled = (anomaly_score - q50) / max(q90 - q50, 1e-9)
+            return round(0.10 * self._clamp01(math.sqrt(max(0.0, scaled))), 6)
+        if anomaly_score <= q95:
+            scaled = (anomaly_score - q90) / max(q95 - q90, 1e-9)
+            return round(0.10 + 0.10 * self._clamp01(scaled), 6)
+        if anomaly_score <= q99:
+            scaled = (anomaly_score - q95) / max(q99 - q95, 1e-9)
+            return round(0.20 + 0.12 * self._clamp01(scaled), 6)
+        if anomaly_score <= q995:
+            scaled = (anomaly_score - q99) / max(q995 - q99, 1e-9)
+            return round(0.474 + 0.024 * self._clamp01(scaled), 6)
+        if anomaly_score <= q999:
+            scaled = (anomaly_score - q995) / max(q999 - q995, 1e-9)
+            return round(0.50 + 0.30 * self._clamp01(scaled), 6)
+        scaled = (anomaly_score - q999) / max(q999 - q995, 1e-9)
+        return round(0.80 + 0.20 * self._clamp01(scaled), 6)
 
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:
             return []
-
         rows = self._aligned_rows(chunks)
-        if hasattr(self.model, "predict_proba"):
-            probs = self.model.predict_proba(rows)
-            return [float(row[1]) for row in probs]
-        if hasattr(self.model, "decision_function"):
-            raw = self.model.decision_function(rows)
-            return [1.0 / (1.0 + math.exp(-float(value))) for value in raw]
-        preds = self.model.predict(rows)
-        return [float(value) for value in preds]
+        raw_scores = self.model.score_samples(rows)
+        anomalies = [-float(value) for value in raw_scores]
+        return [self._risk_from_anomaly(score) for score in anomalies]
 
     def predict_chunk_score(self, chunk: list[dict[str, Any]]) -> float:
         scores = self.predict_chunk_scores([chunk])

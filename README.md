@@ -106,23 +106,6 @@ Production validators now target:
 The repo may still include reference tooling for miner development, but production evaluation is
 driven by the central platform runtime and should not be inferred from local helper artifacts.
 
----
-
-## Local Miner Structure
-
-For local miner development, the repo now separates responsibilities more explicitly:
-
-- `neurons/`: thin miner and validator entrypoints
-- `poker44/miner/`: local miner runtime config, heuristic fallback, and scoring pipeline
-- `poker44_ml/`: feature extraction and model-loading helpers for trained local artifacts
-- `training/`: bot-data generation, dataset building, offline training, and evaluation
-- `poker44/validator/`: validator payload shaping, integrity checks, and synapse contracts
-
-This keeps the validator-facing interfaces stable while making local training and miner iteration
-easier to reason about.
-
----
-
 ## Open-Source Miner Standard
 
 Poker44 supports a lightweight `model_manifest` attached to miner responses.
