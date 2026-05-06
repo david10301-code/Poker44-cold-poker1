@@ -22,7 +22,7 @@ output.png
 .vscode/*
 flightplans/*
 # model/*
-
+hands_generator/
 # models/*
 runs/*
 # C extensions

@@ -17,9 +17,9 @@ from poker44.utils.model_manifest import (
 from poker44.validator.synapse import DetectionSynapse
 
 try:
-    from poker44_ml.inference import HumanBaselineModel
+    from poker44_ml.inference import Poker44Model
 except ImportError:  # pragma: no cover - optional local-model path.
-    HumanBaselineModel = None
+    Poker44Model = None
 
 
 class Miner(BaseMinerNeuron):
@@ -44,18 +44,18 @@ class Miner(BaseMinerNeuron):
         self.model_path = Path(
             os.getenv(
                 "POKER44_MODEL_PATH",
-                str(repo_root / "models" / "poker44_human_baseline.joblib"),
+                str(repo_root / "models" / "poker44_the_top_1.joblib"),
             )
         )
         self.predictor = None
         self.backend = "heuristic"
-        if HumanBaselineModel is not None and self.model_path.exists():
+        if Poker44Model is not None and self.model_path.exists():
             try:
-                self.predictor = HumanBaselineModel(self.model_path)
-                self.backend = "human-baseline-model"
+                self.predictor = Poker44Model(self.model_path)
+                self.backend = "the-top-1-model"
             except Exception as err:
                 bt.logging.warning(
-                    f"Failed to load local human baseline model at {self.model_path}: {err}. "
+                    f"Failed to load local benchmark model at {self.model_path}: {err}. "
                     "Continuing with heuristic backend."
                 )
 
@@ -65,21 +65,21 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": (
-                    "poker44-human-baseline"
+                    "poker44-the-top-1"
                     if self.predictor is not None
                     else "poker44-reference-heuristic"
                 ),
                 "model_version": "1" if self.predictor is not None else "2",
                 "framework": (
-                    self.predictor.metadata.get("framework", "isolation-forest-human-baseline")
+                    self.predictor.metadata.get("framework", "the-top-1")
                     if self.predictor is not None
                     else "python-heuristic"
                 ),
                 "license": "MIT",
-                "repo_url": "https://github.com/Poker44/Poker44-subnet",
+                "repo_url": "https://github.com/Travis861/My_mining_projects.git",
                 "notes": (
-                    "Human-only anomaly model that maps distance from the human corpus "
-                    "to chunk-level bot risk."
+                    "Supervised benchmark model trained on released evaluation chunks "
+                    "with optional auxiliary human negatives."
                     if self.predictor is not None
                     else "Challenge-aligned heuristic miner that scores chunk-level "
                     "behavioral regularity and action patterns."
@@ -87,12 +87,12 @@ class Miner(BaseMinerNeuron):
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (
-                    "Trained only on the human hand corpus and scores chunks by deviation from human behavior."
+                    "Trained on released benchmark chunks with groundTruth labels, plus optional auxiliary human negatives."
                     if self.predictor is not None
                     else "Reference heuristic miner. No training step. Uses only runtime chunk features."
                 ),
                 "training_data_sources": (
-                    ["poker_hands_combined_human_corpus"]
+                    ["released_training_benchmark", "poker_hands_combined_human_corpus"]
                     if self.predictor is not None
                     else ["none"]
                 ),
@@ -269,7 +269,7 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(
             "Validator query received | "
             f"caller={caller} "
-            f"chunk_count={len(chunks)} "
+            f"incoming_chunk_count={len(chunks)} "
             f"chunk_size_range={ [min(chunk_sizes), max(chunk_sizes)] if chunk_sizes else [0, 0] }"
         )
         if self.query_log_preview:
@@ -312,8 +312,8 @@ class Miner(BaseMinerNeuron):
         bt.logging.success(
             "Validator response sent successfully | "
             f"caller={caller} "
-            f"chunk_count={len(chunks)} "
-            f"response_count={len(scores)} "
+            f"incoming_chunk_count={len(chunks)} "
+            f"risk_scores_length={len(scores)} "
             f"elapsed_ms={elapsed_ms:.2f}"
         )
         return synapse

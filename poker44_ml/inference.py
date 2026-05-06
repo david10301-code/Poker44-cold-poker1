@@ -13,8 +13,8 @@ except ImportError:  # pragma: no cover - surfaced only in incomplete runtime en
     joblib = None
 
 
-class HumanBaselineModel:
-    """Runtime wrapper for a human-only baseline model."""
+class Poker44Model:
+    """Runtime wrapper for supervised benchmark or legacy anomaly artifacts."""
 
     def __init__(self, model_path: str | Path):
         if joblib is None:
@@ -28,15 +28,29 @@ class HumanBaselineModel:
             raise FileNotFoundError(f"Model artifact not found: {self.model_path}")
 
         artifact = joblib.load(self.model_path)
-        self.model = artifact["model"]
+        model_list = artifact.get("models")
+        if model_list:
+            self.models = list(model_list)
+        elif artifact.get("model") is not None:
+            self.models = [artifact["model"]]
+        else:
+            raise RuntimeError("Model artifact is missing model content.")
+
         self.feature_names = list(artifact.get("feature_names") or [])
         self.metadata = dict(artifact.get("metadata") or {})
         self.score_quantiles = dict(self.metadata.get("score_quantiles") or {})
+        self.task_type = str(
+            self.metadata.get(
+                "task_type",
+                "human-baseline" if self.score_quantiles else "supervised-benchmark",
+            )
+        )
 
     def _aligned_rows(self, chunks: list[list[dict[str, Any]]]) -> list[list[float]]:
         rows: list[list[float]] = []
         for chunk in chunks:
             feats = chunk_features(chunk)
+            feats["hand_count"] = float(len(chunk))
             if not self.feature_names:
                 self.feature_names = sorted(feats)
             rows.append([float(feats.get(name, 0.0)) for name in self.feature_names])
@@ -45,6 +59,14 @@ class HumanBaselineModel:
     @staticmethod
     def _clamp01(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
+
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        if value >= 0:
+            z = math.exp(-value)
+            return 1.0 / (1.0 + z)
+        z = math.exp(value)
+        return z / (1.0 + z)
 
     def _risk_from_anomaly(self, anomaly_score: float) -> float:
         q50 = float(self.score_quantiles.get("q50", 0.0))
@@ -78,26 +100,60 @@ class HumanBaselineModel:
             return round(0.10 + 0.10 * self._clamp01(scaled), 6)
         if anomaly_score <= q99:
             scaled = (anomaly_score - q95) / max(q99 - q95, 1e-9)
-            return round(0.20 + 0.14 * self._clamp01(scaled), 6)
+            return round(0.20 + 0.08 * self._clamp01(scaled), 6)
         if anomaly_score <= q995:
             scaled = (anomaly_score - q99) / max(q995 - q99, 1e-9)
-            return round(0.34 + 0.11 * self._clamp01(scaled), 6)
+            return round(0.28 + 0.05 * self._clamp01(scaled), 6)
         if anomaly_score <= q999:
             scaled = (anomaly_score - q995) / max(q999 - q995, 1e-9)
-            return round(0.45 + 0.038 * self._clamp01(scaled), 6)
+            return round(0.33 + 0.018 * self._clamp01(scaled), 6)
         if anomaly_score <= q9995:
             scaled = (anomaly_score - q999) / max(q9995 - q999, 1e-9)
-            return round(0.488 + 0.011 * self._clamp01(scaled), 6)
+            return round(0.348 + 0.012 * self._clamp01(scaled), 6)
         scaled = (anomaly_score - q9995) / max(q9995 - q999, 1e-9)
-        return round(0.50 + 0.50 * self._clamp01(math.sqrt(max(0.0, scaled))), 6)
+        return round(0.36 + 0.64 * self._clamp01(math.sqrt(max(0.0, scaled))), 6)
+
+    def _predict_supervised_scores(self, rows: list[list[float]]) -> list[float]:
+        if not rows:
+            return []
+
+        per_model_scores: list[list[float]] = []
+        for model in self.models:
+            if hasattr(model, "predict_proba"):
+                probabilities = model.predict_proba(rows)
+                per_model_scores.append([float(row[1]) for row in probabilities])
+                continue
+            if hasattr(model, "decision_function"):
+                decisions = model.decision_function(rows)
+                per_model_scores.append(
+                    [self._sigmoid(float(value)) for value in decisions]
+                )
+                continue
+            predictions = model.predict(rows)
+            per_model_scores.append([float(value) for value in predictions])
+
+        averaged: list[float] = []
+        for index in range(len(rows)):
+            averaged.append(
+                round(
+                    self._clamp01(
+                        sum(scores[index] for scores in per_model_scores)
+                        / max(len(per_model_scores), 1)
+                    ),
+                    6,
+                )
+            )
+        return averaged
 
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:
             return []
         rows = self._aligned_rows(chunks)
-        raw_scores = self.model.score_samples(rows)
-        anomalies = [-float(value) for value in raw_scores]
-        return [self._risk_from_anomaly(score) for score in anomalies]
+        if self.task_type == "human-baseline" and hasattr(self.models[0], "score_samples"):
+            raw_scores = self.models[0].score_samples(rows)
+            anomalies = [-float(value) for value in raw_scores]
+            return [self._risk_from_anomaly(score) for score in anomalies]
+        return self._predict_supervised_scores(rows)
 
     def predict_chunk_score(self, chunk: list[dict[str, Any]]) -> float:
         scores = self.predict_chunk_scores([chunk])
@@ -120,3 +176,6 @@ class HumanBaselineModel:
             "latency_per_chunk_ms": elapsed_ms / max(len(chunks), 1),
             "total_latency_ms": elapsed_ms,
         }
+
+
+HumanBaselineModel = Poker44Model
