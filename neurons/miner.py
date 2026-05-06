@@ -1,5 +1,6 @@
 """Challenge-aligned Poker44 miner with deterministic chunk heuristics."""
 
+import logging as stdlogging
 import os
 import time
 from collections import Counter
@@ -22,6 +23,31 @@ except ImportError:  # pragma: no cover - optional local-model path.
     Poker44Model = None
 
 
+class _ScannerNoiseFilter(stdlogging.Filter):
+    """Suppress common public-port probe errors emitted before miner routing."""
+
+    _NOISY_SNIPPETS = (
+        "UnknownSynapseError",
+        "InvalidRequestNameError",
+    )
+    _NOISY_REQUEST_NAMES = (
+        "Synapse name ''",
+        "Synapse name 'api'",
+        "Synapse name 'mcp'",
+        "Synapse name 'jsonrpc'",
+        "Synapse name 'robots.txt'",
+        "Could not parser request .",
+    )
+
+    def filter(self, record: stdlogging.LogRecord) -> bool:
+        message = record.getMessage()
+        if not any(snippet in message for snippet in self._NOISY_SNIPPETS):
+            return True
+        if any(name in message for name in self._NOISY_REQUEST_NAMES):
+            return False
+        return True
+
+
 class Miner(BaseMinerNeuron):
     """
     Reference miner for the current provider-runtime challenge path.
@@ -34,6 +60,7 @@ class Miner(BaseMinerNeuron):
     def __init__(self, config=None):
         super(Miner, self).__init__(config=config)
         repo_root = Path(__file__).resolve().parents[1]
+        self._install_scanner_log_filter()
         self.max_hands_per_chunk_eval = max(
             0, int(os.getenv("POKER44_MAX_HANDS_PER_CHUNK_EVAL", "120"))
         )
@@ -44,7 +71,7 @@ class Miner(BaseMinerNeuron):
         self.model_path = Path(
             os.getenv(
                 "POKER44_MODEL_PATH",
-                str(repo_root / "models" / "poker44_the_top_1.joblib"),
+                str(repo_root / "models" / "poker44_benchmark_supervised.joblib"),
             )
         )
         self.predictor = None
@@ -52,7 +79,7 @@ class Miner(BaseMinerNeuron):
         if Poker44Model is not None and self.model_path.exists():
             try:
                 self.predictor = Poker44Model(self.model_path)
-                self.backend = "the-top-1-model"
+                self.backend = "tbenchmark-supervised"
             except Exception as err:
                 bt.logging.warning(
                     f"Failed to load local benchmark model at {self.model_path}: {err}. "
@@ -65,13 +92,13 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": (
-                    "poker44-the-top-1"
+                    "poker44-benchmark-supervised"
                     if self.predictor is not None
                     else "poker44-reference-heuristic"
                 ),
                 "model_version": "1" if self.predictor is not None else "2",
                 "framework": (
-                    self.predictor.metadata.get("framework", "the-top-1")
+                    self.predictor.metadata.get("framework", "benchmark-supervised")
                     if self.predictor is not None
                     else "python-heuristic"
                 ),
@@ -105,6 +132,28 @@ class Miner(BaseMinerNeuron):
         self.manifest_digest = manifest_digest(self.model_manifest)
         self._log_manifest_startup(repo_root)
         bt.logging.info(f"Axon created: {self.axon}")
+
+    @staticmethod
+    def _install_scanner_log_filter() -> None:
+        enabled = os.getenv("POKER44_SUPPRESS_SCANNER_ERRORS", "1").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return
+
+        scanner_filter = _ScannerNoiseFilter()
+        configured = False
+
+        for handler in getattr(bt.logging, "_handlers", []):
+            handler.addFilter(scanner_filter)
+            configured = True
+
+        for logger_name in ("bittensor", "uvicorn.access", "uvicorn.error"):
+            logger = stdlogging.getLogger(logger_name)
+            for handler in logger.handlers:
+                handler.addFilter(scanner_filter)
+                configured = True
+
+        if configured:
+            bt.logging.info("Scanner-noise log filter enabled for invalid public-port probes.")
 
     def _log_manifest_startup(self, repo_root: Path) -> None:
         bt.logging.info("Open-sourced miner manifest standard active for this miner.")
