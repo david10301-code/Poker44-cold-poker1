@@ -103,7 +103,7 @@ class Miner(BaseMinerNeuron):
                     else "python-heuristic"
                 ),
                 "license": "MIT",
-                "repo_url": "https://github.com/Travis861/My_mining_projects.git",
+                "repo_url": "https://github.com/Travis861/Poker44_v1.git",
                 "notes": (
                     "Supervised benchmark model trained on released evaluation chunks "
                     "with optional auxiliary human negatives."
