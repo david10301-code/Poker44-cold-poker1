@@ -79,7 +79,7 @@ class Miner(BaseMinerNeuron):
         if Poker44Model is not None and self.model_path.exists():
             try:
                 self.predictor = Poker44Model(self.model_path)
-                self.backend = "tbenchmark-supervised"
+                self.backend = "benchmark-supervised"
             except Exception as err:
                 bt.logging.warning(
                     f"Failed to load local benchmark model at {self.model_path}: {err}. "
