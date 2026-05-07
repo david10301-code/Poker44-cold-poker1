@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -70,6 +72,32 @@ def _build_feature_matrix(
 
 def _clip_prob(value: float) -> float:
     return max(1e-6, min(1.0 - 1e-6, float(value)))
+
+
+def _git_output(args: list[str]) -> str:
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _repo_metadata() -> dict[str, str]:
+    return {
+        "repo_commit": _git_output(["git", "rev-parse", "HEAD"]),
+        "repo_url": _git_output(["git", "config", "--get", "remote.origin.url"]),
+    }
+
+
+def _feature_schema_hash(feature_names: list[str]) -> str:
+    joined = "\n".join(feature_names).encode("utf-8")
+    return hashlib.sha256(joined).hexdigest()
 
 
 def _average_probabilities(models: list[object], rows: list[list[float]]) -> list[float]:
@@ -216,6 +244,8 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     metadata = {
         "framework": "extra-trees+hist-gradient-boosting",
         "task_type": "supervised-benchmark",
+        **_repo_metadata(),
+        "feature_schema_hash": _feature_schema_hash(feature_names),
         "benchmark_paths": [str(path) for path in benchmark_paths],
         "benchmark_file_count": float(len(benchmark_paths)),
         "benchmark_rows": float(len(benchmark_examples)),

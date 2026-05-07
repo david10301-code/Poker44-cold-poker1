@@ -2,6 +2,7 @@
 
 import logging as stdlogging
 import os
+import subprocess
 import time
 from collections import Counter
 from pathlib import Path
@@ -134,6 +135,20 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(f"Axon created: {self.axon}")
 
     @staticmethod
+    def _repo_head(repo_root: Path) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return completed.stdout.strip()
+        except Exception:
+            return ""
+
+    @staticmethod
     def _install_scanner_log_filter() -> None:
         enabled = os.getenv("POKER44_SUPPRESS_SCANNER_ERRORS", "1").strip().lower()
         if enabled not in {"1", "true", "yes", "on"}:
@@ -181,10 +196,20 @@ class Miner(BaseMinerNeuron):
             f"query_log_preview={self.query_log_preview}"
         )
         if self.predictor is not None:
+            artifact_commit = str(self.predictor.metadata.get("repo_commit", ""))
+            runtime_commit = self._repo_head(repo_root)
             bt.logging.info(
                 f"Model metadata: feature_count={len(self.predictor.feature_names)} "
-                f"framework={self.predictor.metadata.get('framework', 'unknown')}"
+                f"framework={self.predictor.metadata.get('framework', 'unknown')} "
+                f"artifact_commit={artifact_commit or 'unknown'} "
+                f"runtime_commit={runtime_commit or 'unknown'} "
+                f"feature_schema_hash={self.predictor.metadata.get('feature_schema_hash', 'unknown')}"
             )
+            if artifact_commit and runtime_commit and artifact_commit != runtime_commit:
+                bt.logging.warning(
+                    "Model artifact commit does not match current checkout | "
+                    f"artifact_commit={artifact_commit} runtime_commit={runtime_commit}"
+                )
         whitelist = sorted(self.validator_hotkey_whitelist)
         bt.logging.info(
             "Access policy | "
