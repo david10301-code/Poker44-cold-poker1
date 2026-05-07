@@ -18,7 +18,7 @@ MIN_REQUIRED_MANIFEST_FIELDS = [
     "training_data_statement",
     "private_data_attestation",
 ]
-REFERENCE_MINER_MODEL_NAME = "poker44-reference-heuristic"
+REFERENCE_MINER_MODEL_NAME = "poker44_benchmark_supervised"
 REFERENCE_REPO_URL = "https://github.com/Poker44/Poker44-subnet"
 GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
@@ -61,7 +61,7 @@ def build_local_model_manifest(
         ),
         "model_name": os.getenv(
             "POKER44_MODEL_NAME",
-            str(default_values.get("model_name", "poker44-reference-heuristic")),
+            str(default_values.get("model_name", "poker44_benchmark_supervised")),
         ),
         "model_version": os.getenv(
             "POKER44_MODEL_VERSION",
@@ -69,7 +69,7 @@ def build_local_model_manifest(
         ),
         "framework": os.getenv(
             "POKER44_MODEL_FRAMEWORK",
-            str(default_values.get("framework", "python-heuristic")),
+            str(default_values.get("framework", "benchmark-supervised")),
         ),
         "license": os.getenv(
             "POKER44_MODEL_LICENSE",
