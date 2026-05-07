@@ -93,7 +93,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[Path(__file__).resolve()],
             defaults={
                 "model_name": (
-                    "poker44-benchmark-supervised"
+                    "poker44_benchmark_supervised"
                     if self.predictor is not None
                     else "poker44-reference-heuristic"
                 ),
@@ -103,7 +103,7 @@ class Miner(BaseMinerNeuron):
                     if self.predictor is not None
                     else "python-heuristic"
                 ),
-                "license": "MIT",
+                # "license": "MIT",
                 "repo_url": "https://github.com/Travis861/Poker44_v1.git",
                 "notes": (
                     "Supervised benchmark model trained on released evaluation chunks "
