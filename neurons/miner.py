@@ -15,7 +15,6 @@ from poker44.utils.model_manifest import (
     build_local_model_manifest,
     evaluate_manifest_compliance,
     manifest_digest,
-    normalize_model_manifest,
 )
 from poker44.validator.synapse import DetectionSynapse
 
@@ -89,7 +88,8 @@ class Miner(BaseMinerNeuron):
                 )
 
         bt.logging.info(f"🤖 Poker44 Miner started with backend={self.backend}")
-        built_manifest = build_local_model_manifest(
+        runtime_commit = self._repo_head(repo_root)
+        self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
             implementation_files=[Path(__file__).resolve()],
             defaults={
@@ -104,11 +104,14 @@ class Miner(BaseMinerNeuron):
                     if self.predictor is not None
                     else "python-heuristic"
                 ),
-                # "license": "MIT",
+                "repo_commit": (
+                    str(self.predictor.metadata.get("repo_commit", "")).strip()
+                    if self.predictor is not None
+                    else runtime_commit
+                ) or runtime_commit,
                 "repo_url": "https://github.com/Travis861/Poker44_v1.git",
                 "notes": (
-                    "Supervised benchmark model trained on released evaluation chunks "
-                    "with optional auxiliary human negatives."
+                    "Supervised benchmark model trained on released evaluation chunks."
                     if self.predictor is not None
                     else "Challenge-aligned heuristic miner that scores chunk-level "
                     "behavioral regularity and action patterns."
@@ -116,21 +119,20 @@ class Miner(BaseMinerNeuron):
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (
-                    "Trained on released benchmark chunks with groundTruth labels, plus optional auxiliary human negatives."
+                    "Trained on released benchmark chunks with groundTruth labels."
                     if self.predictor is not None
                     else "Reference heuristic miner. No training step. Uses only runtime chunk features."
                 ),
                 "training_data_sources": (
-                    ["released_training_benchmark", "poker_hands_combined_human_corpus"]
+                    ["released_training_benchmark"]
                     if self.predictor is not None
                     else ["none"]
                 ),
                 "private_data_attestation": (
-                    "This reference miner does not train on validator-only evaluation data."
+                    "This reference miner did not train on validator-only evaluation data, but trained on benchmark training data."
                 ),
             },
         )
-        self.model_manifest = self._opaque_manifest(built_manifest)
         self.manifest_compliance = evaluate_manifest_compliance(self.model_manifest)
         self.manifest_digest = manifest_digest(self.model_manifest)
         self._log_manifest_startup(repo_root)
@@ -172,26 +174,8 @@ class Miner(BaseMinerNeuron):
         if configured:
             bt.logging.info("Scanner-noise log filter enabled for invalid public-port probes.")
 
-    @staticmethod
-    def _opaque_manifest(manifest: dict) -> dict:
-        redacted = dict(manifest or {})
-        redacted["open_source"] = False
-        for key in (
-            "repo_url",
-            "repo_commit",
-            "artifact_url",
-            "artifact_sha256",
-            "model_card_url",
-            "training_data_statement",
-            "training_data_sources",
-            "private_data_attestation",
-            "notes",
-        ):
-            redacted.pop(key, None)
-        return normalize_model_manifest(redacted)
-
     def _log_manifest_startup(self, repo_root: Path) -> None:
-        bt.logging.info("Miner manifest standard active for this miner.")
+        bt.logging.info("Open-sourced miner manifest standard active for this miner.")
         bt.logging.info(
             f"Miner transparency status: {self.manifest_compliance['status']} "
             f"(missing_fields={self.manifest_compliance['missing_fields']})"

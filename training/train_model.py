@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--benchmark-path", type=str, default=None)
     parser.add_argument("--human-path", type=str, default=None)
-    parser.add_argument("--disable-aux-human", action="store_true")
+    parser.add_argument("--enable-aux-human", action="store_true")
     parser.add_argument("--aux-human-weight", type=float, default=0.35)
     parser.add_argument("--max-aux-human-chunks", type=int, default=160)
     parser.add_argument("--chunk-size", type=int, default=80)
@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=40)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--test-size", type=float, default=0.25)
+    parser.add_argument("--holdout-source-dates", type=str, default=None)
+    parser.add_argument("--holdout-latest-days", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-estimators", type=int, default=300)
     parser.add_argument("--max-depth", type=int, default=5)
@@ -137,6 +139,71 @@ def _binary_metrics(labels: list[int], probabilities: list[float]) -> dict[str, 
     }
 
 
+def _split_benchmark_examples(
+    examples: list[dict[str, Any]],
+    *,
+    test_size: float,
+    seed: int,
+    holdout_source_dates: str | None,
+    holdout_latest_days: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    available_dates = sorted(
+        {str(example.get("source_date", "")).strip() for example in examples if str(example.get("source_date", "")).strip()}
+    )
+
+    if holdout_source_dates:
+        requested = [
+            item.strip()
+            for item in holdout_source_dates.split(",")
+            if item.strip()
+        ]
+        holdout_dates = [date for date in requested if date in available_dates]
+        if not holdout_dates:
+            raise RuntimeError(
+                f"Requested holdout dates {requested} not found in available source dates {available_dates}."
+            )
+    elif len(available_dates) > 1:
+        holdout_count = max(1, min(int(holdout_latest_days), len(available_dates) - 1))
+        holdout_dates = available_dates[-holdout_count:]
+    else:
+        holdout_dates = []
+
+    if holdout_dates:
+        holdout_set = set(holdout_dates)
+        train_examples = [
+            example for example in examples
+            if str(example.get("source_date", "")).strip() not in holdout_set
+        ]
+        test_examples = [
+            example for example in examples
+            if str(example.get("source_date", "")).strip() in holdout_set
+        ]
+        if not train_examples or not test_examples:
+            raise RuntimeError(
+                f"Source-date holdout produced an empty split. holdout_dates={holdout_dates}"
+            )
+        return train_examples, test_examples, {
+            "split_strategy": "holdout_source_dates",
+            "holdout_source_dates": list(holdout_dates),
+            "train_source_dates": [
+                date for date in available_dates if date not in holdout_set
+            ],
+        }
+
+    labels = [int(example["label"]) for example in examples]
+    train_examples, test_examples = train_test_split(
+        examples,
+        test_size=test_size,
+        random_state=seed,
+        stratify=labels,
+    )
+    return train_examples, test_examples, {
+        "split_strategy": "random_chunk_split",
+        "holdout_source_dates": [],
+        "train_source_dates": list(available_dates),
+    }
+
+
 def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict[str, float], dict[str, Any]]:
     if joblib is None:
         raise RuntimeError("joblib is required to save the benchmark model.")
@@ -158,35 +225,34 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     if min(label_counts.values()) < 2:
         raise RuntimeError("Benchmark dataset is too small to create a stratified split.")
 
-    benchmark_rows = [example["features"] for example in benchmark_examples]
-    benchmark_labels = [int(example["label"]) for example in benchmark_examples]
-    benchmark_chunks = [example["chunk"] for example in benchmark_examples]
-
-    feature_names = sorted(benchmark_rows[0].keys())
-    X_benchmark = _build_feature_matrix(benchmark_rows, feature_names)
-
-    (
-        X_train_base,
-        X_test,
-        y_train_base,
-        y_test,
-        _chunks_train,
-        chunks_test,
-    ) = train_test_split(
-        X_benchmark,
-        benchmark_labels,
-        benchmark_chunks,
+    train_examples, test_examples, split_info = _split_benchmark_examples(
+        benchmark_examples,
         test_size=args.test_size,
-        random_state=args.seed,
-        stratify=benchmark_labels,
+        seed=args.seed,
+        holdout_source_dates=args.holdout_source_dates,
+        holdout_latest_days=args.holdout_latest_days,
     )
+    benchmark_label_sum = sum(int(example["label"]) for example in benchmark_examples)
+
+    benchmark_rows = [example["features"] for example in benchmark_examples]
+    feature_names = sorted(benchmark_rows[0].keys())
+
+    X_train_base = _build_feature_matrix(
+        [example["features"] for example in train_examples], feature_names
+    )
+    X_test = _build_feature_matrix(
+        [example["features"] for example in test_examples], feature_names
+    )
+    y_train_base = [int(example["label"]) for example in train_examples]
+    y_test = [int(example["label"]) for example in test_examples]
+    chunks_test = [example["chunk"] for example in test_examples]
 
     X_train = list(X_train_base)
     y_train = list(y_train_base)
     sample_weight = [1.0 for _ in X_train]
     aux_human_rows_added = 0
 
-    if not args.disable_aux_human:
+    if args.enable_aux_human:
         human_path = resolve_human_path(args.human_path)
         human_hands = load_json_or_gz(human_path)
         aux_rows = build_human_chunk_rows(
@@ -246,11 +312,12 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "task_type": "supervised-benchmark",
         **_repo_metadata(),
         "feature_schema_hash": _feature_schema_hash(feature_names),
+        **split_info,
         "benchmark_paths": [str(path) for path in benchmark_paths],
         "benchmark_file_count": float(len(benchmark_paths)),
         "benchmark_rows": float(len(benchmark_examples)),
-        "benchmark_positive_rows": float(sum(benchmark_labels)),
-        "benchmark_negative_rows": float(len(benchmark_labels) - sum(benchmark_labels)),
+        "benchmark_positive_rows": float(benchmark_label_sum),
+        "benchmark_negative_rows": float(len(benchmark_examples) - benchmark_label_sum),
         "train_rows": float(len(X_train)),
         "test_rows": float(len(X_test)),
         "aux_human_rows": float(aux_human_rows_added),
@@ -291,6 +358,8 @@ def main() -> None:
     print(
         "Selected config: "
         f"framework={metadata.get('framework')} "
+        f"split_strategy={metadata.get('split_strategy')} "
+        f"holdout_dates={metadata.get('holdout_source_dates')} "
         f"benchmark_files={metadata.get('benchmark_file_count')} "
         f"benchmark_rows={metadata.get('benchmark_rows')} "
         f"aux_human_rows={metadata.get('aux_human_rows')} "
