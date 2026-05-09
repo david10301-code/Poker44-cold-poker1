@@ -191,6 +191,46 @@ def _binary_metrics(labels: list[int], probabilities: list[float]) -> dict[str, 
     }
 
 
+def _overfit_risk_warnings(
+    *,
+    metrics: dict[str, float],
+    metadata: dict[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+    test_rows = int(float(metadata.get("test_rows", 0.0) or 0.0))
+    holdout_dates = list(metadata.get("holdout_source_dates") or [])
+    benchmark_files = int(float(metadata.get("benchmark_file_count", 0.0) or 0.0))
+    perfect_at_threshold = (
+        float(metrics.get("recall_at_0_5", 0.0)) >= 0.999999
+        and float(metrics.get("precision_at_0_5", 0.0)) >= 0.999999
+        and float(metrics.get("fpr_at_0_5", 1.0)) <= 0.000001
+    )
+    near_perfect_ranking = (
+        float(metrics.get("roc_auc", 0.0)) >= 0.999999
+        and float(metrics.get("pr_auc", 0.0)) >= 0.999999
+    )
+
+    if perfect_at_threshold and near_perfect_ranking and test_rows <= 500:
+        warnings.append(
+            "Evaluation is effectively perfect on a small holdout. This may be optimistic; validate on more released days."
+        )
+    if perfect_at_threshold and len(holdout_dates) <= 1:
+        warnings.append(
+            "Only one held-out sourceDate was used. Add more held-out dates to reduce day-specific overfit risk."
+        )
+    if perfect_at_threshold and benchmark_files <= 1:
+        warnings.append(
+            "Training/evaluation used only one benchmark file. Use multiple released benchmark files for a stronger anti-overfit check."
+        )
+    raw_human_max = float(metrics.get("raw_human_prob_max", 0.0))
+    raw_bot_min = float(metrics.get("raw_bot_prob_min", 1.0))
+    if perfect_at_threshold and raw_human_max < 0.15 and raw_bot_min > 0.7:
+        warnings.append(
+            "Raw class separation is extremely large on the holdout. Recheck on unseen release days and live validator traffic."
+        )
+    return warnings
+
+
 def _split_benchmark_examples(
     examples: list[dict[str, Any]],
     *,
@@ -435,6 +475,10 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     latency = loaded.benchmark_latency(latency_chunks or benchmark_chunks[:2])
     metrics["latency_per_chunk_ms"] = latency["latency_per_chunk_ms"]
     metrics["prob_mean"] = sum(probabilities) / max(len(probabilities), 1)
+    metadata["overfit_warnings"] = _overfit_risk_warnings(
+        metrics=metrics,
+        metadata=metadata,
+    )
     return models, feature_names, metrics, metadata
 
 
@@ -476,6 +520,8 @@ def main() -> None:
         "latency_per_chunk_ms",
     ):
         print(f"{key}={float(metrics.get(key, 0.0)):.6f}")
+    for warning in metadata.get("overfit_warnings", []):
+        print(f"overfit_warning={warning}")
 
 
 if __name__ == "__main__":
