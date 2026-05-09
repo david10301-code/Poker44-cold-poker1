@@ -50,13 +50,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-chunk-size", type=int, default=40)
     parser.add_argument("--stride", type=int, default=40)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--test-size", type=float, default=0.25)
+    parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--holdout-source-dates", type=str, default=None)
     parser.add_argument("--holdout-latest-days", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-estimators", type=int, default=300)
     parser.add_argument("--max-depth", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=0.05)
+    parser.add_argument("--calibration-size", type=float, default=0.15)
     parser.add_argument(
         "--output",
         type=str,
@@ -74,6 +75,10 @@ def _build_feature_matrix(
 
 def _clip_prob(value: float) -> float:
     return max(1e-6, min(1.0 - 1e-6, float(value)))
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
 
 
 def _git_output(args: list[str]) -> str:
@@ -115,6 +120,53 @@ def _average_probabilities(models: list[object], rows: list[list[float]]) -> lis
             sum(scores[index] for scores in per_model_scores) / max(len(per_model_scores), 1)
         )
     return averaged
+
+
+def _derive_score_remap(labels: list[int], probabilities: list[float]) -> dict[str, float]:
+    negatives = sorted(
+        float(prob) for prob, label in zip(probabilities, labels) if int(label) == 0
+    )
+    positives = sorted(
+        float(prob) for prob, label in zip(probabilities, labels) if int(label) == 1
+    )
+    if not negatives or not positives:
+        return {}
+
+    human_upper = negatives[-1]
+    bot_lower_candidates = [value for value in positives if value > human_upper]
+    if bot_lower_candidates:
+        bot_lower = bot_lower_candidates[0]
+        gap = max(bot_lower - human_upper, 1e-6)
+        threshold = human_upper + 0.15 * gap
+        threshold = min(threshold, 0.35)
+    else:
+        bot_lower = positives[0]
+        threshold = 0.5
+
+    threshold = min(max(threshold, 1e-6), 1.0 - 1e-6)
+    return {
+        "kind": "threshold_centering_v1",
+        "threshold": float(threshold),
+        "human_upper": float(human_upper),
+        "bot_lower": float(bot_lower),
+    }
+
+
+def _apply_score_remap(probabilities: list[float], remap: dict[str, Any] | None) -> list[float]:
+    if not probabilities or not remap:
+        return [_clamp01(value) for value in probabilities]
+
+    threshold = float(remap.get("threshold", 0.5))
+    threshold = min(max(threshold, 1e-6), 1.0 - 1e-6)
+    adjusted: list[float] = []
+    for value in probabilities:
+        score = _clamp01(value)
+        if score <= threshold:
+            mapped = 0.5 * score / threshold
+        else:
+            mapped = 0.5 + 0.5 * (score - threshold) / (1.0 - threshold)
+        adjusted.append(round(_clamp01(mapped), 6))
+    return adjusted
 
 
 def _binary_metrics(labels: list[int], probabilities: list[float]) -> dict[str, float]:
@@ -237,15 +289,36 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     benchmark_rows = [example["features"] for example in benchmark_examples]
     feature_names = sorted(benchmark_rows[0].keys())
 
-    X_train_base = _build_feature_matrix(
-        [example["features"] for example in train_examples], feature_names
-    )
     X_test = _build_feature_matrix(
         [example["features"] for example in test_examples], feature_names
     )
-    y_train_base = [int(example["label"]) for example in train_examples]
     y_test = [int(example["label"]) for example in test_examples]
     chunks_test = [example["chunk"] for example in test_examples]
+
+    calibration_examples: list[dict[str, Any]] = []
+    fit_examples = list(train_examples)
+    fit_labels = [int(example["label"]) for example in fit_examples]
+    if (
+        len(fit_examples) >= 20
+        and len({*fit_labels}) >= 2
+        and args.calibration_size > 0.0
+    ):
+        calib_size = min(max(float(args.calibration_size), 0.05), 0.4)
+        fit_examples, calibration_examples = train_test_split(
+            fit_examples,
+            test_size=calib_size,
+            random_state=args.seed,
+            stratify=fit_labels,
+        )
+
+    X_train_base = _build_feature_matrix(
+        [example["features"] for example in fit_examples], feature_names
+    )
+    y_train_base = [int(example["label"]) for example in fit_examples]
+    X_calibration = _build_feature_matrix(
+        [example["features"] for example in calibration_examples], feature_names
+    )
+    y_calibration = [int(example["label"]) for example in calibration_examples]
 
     X_train = list(X_train_base)
     y_train = list(y_train_base)
@@ -294,7 +367,11 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     hist_gradient.fit(X_train, y_train, sample_weight=sample_weight)
     models: list[object] = [extra_trees, hist_gradient]
 
-    probabilities = _average_probabilities(models, X_test)
+    calibration_raw_probabilities = _average_probabilities(models, X_calibration)
+    score_remap = _derive_score_remap(y_calibration, calibration_raw_probabilities)
+
+    raw_probabilities = _average_probabilities(models, X_test)
+    probabilities = _apply_score_remap(raw_probabilities, score_remap)
     clipped = [_clip_prob(value) for value in probabilities]
     metrics = _binary_metrics(y_test, probabilities)
     metrics["roc_auc"] = roc_auc_score(y_test, probabilities)
@@ -306,12 +383,21 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     bot_probs = [prob for prob, label in zip(probabilities, y_test) if label == 1]
     metrics["human_prob_max"] = max(human_probs) if human_probs else 0.0
     metrics["bot_prob_min"] = min(bot_probs) if bot_probs else 0.0
+    raw_human_probs = [
+        prob for prob, label in zip(raw_probabilities, y_test) if label == 0
+    ]
+    raw_bot_probs = [
+        prob for prob, label in zip(raw_probabilities, y_test) if label == 1
+    ]
+    metrics["raw_human_prob_max"] = max(raw_human_probs) if raw_human_probs else 0.0
+    metrics["raw_bot_prob_min"] = min(raw_bot_probs) if raw_bot_probs else 0.0
 
     metadata = {
-        "framework": "extra-trees+hist-gradient-boosting",
+        "framework": "sklearn.ExtraTreesClassifier+sklearn.HistGradientBoostingClassifier",
         "task_type": "supervised-benchmark",
         **_repo_metadata(),
         "feature_schema_hash": _feature_schema_hash(feature_names),
+        "score_remap": score_remap,
         **split_info,
         "benchmark_paths": [str(path) for path in benchmark_paths],
         "benchmark_file_count": float(len(benchmark_paths)),
@@ -320,11 +406,13 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "benchmark_negative_rows": float(len(benchmark_examples) - benchmark_label_sum),
         "train_rows": float(len(X_train)),
         "test_rows": float(len(X_test)),
+        "calibration_rows": float(len(X_calibration)),
         "aux_human_rows": float(aux_human_rows_added),
         "aux_human_weight": float(args.aux_human_weight),
         "n_estimators": float(args.n_estimators),
         "max_depth": float(args.max_depth),
         "learning_rate": float(args.learning_rate),
+        "calibration_size": float(args.calibration_size),
         "chunk_size": float(args.chunk_size),
         "min_chunk_size": float(args.min_chunk_size),
         "stride": float(args.stride),
@@ -383,6 +471,8 @@ def main() -> None:
         "human_prob_max",
         "bot_prob_min",
         "prob_mean",
+        "raw_human_prob_max",
+        "raw_bot_prob_min",
         "latency_per_chunk_ms",
     ):
         print(f"{key}={float(metrics.get(key, 0.0)):.6f}")

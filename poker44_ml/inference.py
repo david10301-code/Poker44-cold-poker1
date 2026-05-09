@@ -39,6 +39,7 @@ class Poker44Model:
         self.feature_names = list(artifact.get("feature_names") or [])
         self.metadata = dict(artifact.get("metadata") or {})
         self.score_quantiles = dict(self.metadata.get("score_quantiles") or {})
+        self.score_remap = dict(self.metadata.get("score_remap") or {})
         self.task_type = str(
             self.metadata.get(
                 "task_type",
@@ -135,15 +136,28 @@ class Poker44Model:
         averaged: list[float] = []
         for index in range(len(rows)):
             averaged.append(
-                round(
-                    self._clamp01(
-                        sum(scores[index] for scores in per_model_scores)
-                        / max(len(per_model_scores), 1)
-                    ),
-                    6,
+                self._clamp01(
+                    sum(scores[index] for scores in per_model_scores)
+                    / max(len(per_model_scores), 1)
                 )
             )
-        return averaged
+        return [round(value, 6) for value in self._apply_supervised_score_remap(averaged)]
+
+    def _apply_supervised_score_remap(self, probabilities: list[float]) -> list[float]:
+        if not probabilities or not self.score_remap:
+            return [self._clamp01(value) for value in probabilities]
+
+        threshold = float(self.score_remap.get("threshold", 0.5))
+        threshold = min(max(threshold, 1e-6), 1.0 - 1e-6)
+        adjusted: list[float] = []
+        for value in probabilities:
+            score = self._clamp01(value)
+            if score <= threshold:
+                mapped = 0.5 * score / threshold
+            else:
+                mapped = 0.5 + 0.5 * (score - threshold) / (1.0 - threshold)
+            adjusted.append(self._clamp01(mapped))
+        return adjusted
 
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:

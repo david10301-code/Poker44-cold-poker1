@@ -375,9 +375,14 @@ class Miner(BaseMinerNeuron):
         synapse.model_manifest = dict(self.model_manifest)
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+        total_hands = sum(chunk_sizes)
+        per_chunk_ms = elapsed_ms / max(len(chunks), 1)
+        per_hand_ms = elapsed_ms / max(total_hands, 1)
         message = (
             f"Scored {len(chunks)} chunks with backend={backend_used} "
             f"elapsed_ms={elapsed_ms:.2f} "
+            f"per_chunk_ms={per_chunk_ms:.2f} "
+            f"per_hand_ms={per_hand_ms:.2f} "
             f"chunk_size_range={ [min(chunk_sizes), max(chunk_sizes)] if chunk_sizes else [0, 0] } "
             f"score_range={ [min(scores), max(scores)] if scores else [0.0, 0.0] }"
         )
@@ -392,7 +397,9 @@ class Miner(BaseMinerNeuron):
             f"caller={caller} "
             f"incoming_chunk_count={len(chunks)} "
             f"risk_scores_length={len(scores)} "
-            f"elapsed_ms={elapsed_ms:.2f}"
+            f"elapsed_ms={elapsed_ms:.2f} "
+            f"per_chunk_ms={per_chunk_ms:.2f} "
+            f"per_hand_ms={per_hand_ms:.2f}"
         )
         return synapse
 
