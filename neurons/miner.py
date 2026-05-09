@@ -89,6 +89,7 @@ class Miner(BaseMinerNeuron):
 
         bt.logging.info(f"🤖 Poker44 Miner started with backend={self.backend}")
         runtime_commit = self._repo_head(repo_root)
+        runtime_repo_url = self._repo_url(repo_root)
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
             implementation_files=[Path(__file__).resolve()],
@@ -109,7 +110,15 @@ class Miner(BaseMinerNeuron):
                     if self.predictor is not None
                     else runtime_commit
                 ) or runtime_commit,
-                "repo_url": "https://github.com/Travis861/Poker44_v1.git",
+                "repo_url": (
+                    os.getenv("POKER44_MODEL_REPO_URL", "").strip()
+                    or (
+                        str(self.predictor.metadata.get("repo_url", "")).strip()
+                        if self.predictor is not None
+                        else ""
+                    )
+                    or runtime_repo_url
+                ),
                 "notes": (
                     "Supervised benchmark model trained on released evaluation chunks."
                     if self.predictor is not None
@@ -143,6 +152,20 @@ class Miner(BaseMinerNeuron):
         try:
             completed = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return completed.stdout.strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _repo_url(repo_root: Path) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", "config", "--get", "remote.origin.url"],
                 cwd=repo_root,
                 check=True,
                 capture_output=True,
