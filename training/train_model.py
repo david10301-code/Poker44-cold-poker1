@@ -138,7 +138,13 @@ def _derive_score_remap(labels: list[int], probabilities: list[float]) -> dict[s
         bot_lower = bot_lower_candidates[0]
         gap = max(bot_lower - human_upper, 1e-6)
         threshold = human_upper + 0.15 * gap
-        threshold = min(threshold, 0.35)
+        # Keep the remap boundary inside the clean human/bot gap instead of
+        # forcing it down to a global cap, which can push high-human scores
+        # above 0.5 after remapping.
+        threshold = min(
+            max(threshold, human_upper + 1e-6),
+            bot_lower - 1e-6,
+        )
     else:
         bot_lower = positives[0]
         threshold = 0.5
