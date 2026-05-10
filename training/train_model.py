@@ -23,13 +23,21 @@ except ImportError:  # pragma: no cover - surfaced only in incomplete runtime en
 
 try:
     from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier
-    from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
+    from sklearn.metrics import (
+        average_precision_score,
+        brier_score_loss,
+        log_loss,
+        matthews_corrcoef,
+        roc_auc_score,
+    )
     from sklearn.model_selection import train_test_split
 except ImportError:  # pragma: no cover - surfaced only in incomplete runtime envs.
     ExtraTreesClassifier = None
     HistGradientBoostingClassifier = None
     average_precision_score = None
+    brier_score_loss = None
     log_loss = None
+    matthews_corrcoef = None
     roc_auc_score = None
     train_test_split = None
 
@@ -122,7 +130,10 @@ def _average_probabilities(models: list[object], rows: list[list[float]]) -> lis
     return averaged
 
 
-def _derive_score_remap(labels: list[int], probabilities: list[float]) -> dict[str, float]:
+def _derive_score_remap(
+    labels: list[int],
+    probabilities: list[float],
+) -> dict[str, float]:
     negatives = sorted(
         float(prob) for prob, label in zip(probabilities, labels) if int(label) == 0
     )
@@ -138,9 +149,6 @@ def _derive_score_remap(labels: list[int], probabilities: list[float]) -> dict[s
         bot_lower = bot_lower_candidates[0]
         gap = max(bot_lower - human_upper, 1e-6)
         threshold = human_upper + 0.15 * gap
-        # Keep the remap boundary inside the clean human/bot gap instead of
-        # forcing it down to a global cap, which can push high-human scores
-        # above 0.5 after remapping.
         threshold = min(
             max(threshold, human_upper + 1e-6),
             bot_lower - 1e-6,
@@ -309,7 +317,9 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         ExtraTreesClassifier is None
         or HistGradientBoostingClassifier is None
         or average_precision_score is None
+        or brier_score_loss is None
         or log_loss is None
+        or matthews_corrcoef is None
         or roc_auc_score is None
         or train_test_split is None
     ):
@@ -423,6 +433,10 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     metrics["roc_auc"] = roc_auc_score(y_test, probabilities)
     metrics["pr_auc"] = average_precision_score(y_test, probabilities)
     metrics["log_loss"] = log_loss(y_test, clipped)
+    metrics["brier_score"] = brier_score_loss(y_test, probabilities)
+    metrics["mcc_at_0_5"] = matthews_corrcoef(
+        y_test, [1 if prob >= 0.5 else 0 for prob in probabilities]
+    )
     metrics["prob_min"] = min(probabilities) if probabilities else 0.0
     metrics["prob_max"] = max(probabilities) if probabilities else 0.0
     human_probs = [prob for prob, label in zip(probabilities, y_test) if label == 0]
@@ -509,6 +523,8 @@ def main() -> None:
         "roc_auc",
         "pr_auc",
         "log_loss",
+        "brier_score",
+        "mcc_at_0_5",
         "recall_at_0_5",
         "precision_at_0_5",
         "fpr_at_0_5",

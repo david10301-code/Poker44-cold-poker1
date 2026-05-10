@@ -10,10 +10,18 @@ from training.build_dataset import load_benchmark_examples, resolve_benchmark_pa
 from training.train_model import _binary_metrics, _clip_prob
 
 try:
-    from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
+    from sklearn.metrics import (
+        average_precision_score,
+        brier_score_loss,
+        log_loss,
+        matthews_corrcoef,
+        roc_auc_score,
+    )
 except ImportError:  # pragma: no cover - surfaced only in incomplete runtime envs.
     average_precision_score = None
+    brier_score_loss = None
     log_loss = None
+    matthews_corrcoef = None
     roc_auc_score = None
 
 
@@ -60,6 +68,12 @@ def _evaluate_examples(
         metrics["roc_auc"] = float(roc_auc_score(labels, probabilities))
     if log_loss is not None:
         metrics["log_loss"] = float(log_loss(labels, clipped))
+    if brier_score_loss is not None:
+        metrics["brier_score"] = float(brier_score_loss(labels, probabilities))
+    if matthews_corrcoef is not None:
+        metrics["mcc_at_0_5"] = float(
+            matthews_corrcoef(labels, [1 if prob >= 0.5 else 0 for prob in probabilities])
+        )
 
     metrics["prob_min"] = min(probabilities) if probabilities else 0.0
     metrics["prob_max"] = max(probabilities) if probabilities else 0.0
@@ -92,6 +106,8 @@ def _print_metric_block(title: str, metrics: dict[str, float], rows: int) -> Non
         "roc_auc",
         "pr_auc",
         "log_loss",
+        "brier_score",
+        "mcc_at_0_5",
         "recall_at_0_5",
         "precision_at_0_5",
         "fpr_at_0_5",
