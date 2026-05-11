@@ -90,6 +90,16 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(f"🤖 Poker44 Miner started with backend={self.backend}")
         runtime_commit = self._repo_head(repo_root)
         runtime_repo_url = self._repo_url(repo_root)
+        published_repo_commit = (
+            str(self.predictor.metadata.get("repo_commit", "")).strip()
+            if self.predictor is not None
+            else runtime_commit
+        ) or runtime_commit
+        published_repo_url = (
+            str(self.predictor.metadata.get("repo_url", "")).strip()
+            if self.predictor is not None
+            else runtime_repo_url
+        ) or runtime_repo_url
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
             implementation_files=[Path(__file__).resolve()],
@@ -105,20 +115,8 @@ class Miner(BaseMinerNeuron):
                     if self.predictor is not None
                     else "python-heuristic"
                 ),
-                "repo_commit": (
-                    str(self.predictor.metadata.get("repo_commit", "")).strip()
-                    if self.predictor is not None
-                    else runtime_commit
-                ) or runtime_commit,
-                "repo_url": (
-                    os.getenv("POKER44_MODEL_REPO_URL", "").strip()
-                    or (
-                        str(self.predictor.metadata.get("repo_url", "")).strip()
-                        if self.predictor is not None
-                        else ""
-                    )
-                    or runtime_repo_url
-                ),
+                "repo_commit": published_repo_commit,
+                "repo_url": published_repo_url,
                 "notes": (
                     "Supervised benchmark model trained on released evaluation chunks."
                     if self.predictor is not None
@@ -142,6 +140,22 @@ class Miner(BaseMinerNeuron):
                 ),
             },
         )
+        override_repo_url = os.getenv("POKER44_MODEL_REPO_URL", "").strip()
+        override_repo_commit = os.getenv("POKER44_MODEL_REPO_COMMIT", "").strip()
+        if override_repo_url and override_repo_url != published_repo_url:
+            bt.logging.warning(
+                "Ignoring POKER44_MODEL_REPO_URL override because it does not match "
+                f"the active model/runtime identity | override={override_repo_url} "
+                f"published={published_repo_url}"
+            )
+        if override_repo_commit and override_repo_commit != published_repo_commit:
+            bt.logging.warning(
+                "Ignoring POKER44_MODEL_REPO_COMMIT override because it does not match "
+                f"the active model/runtime identity | override={override_repo_commit} "
+                f"published={published_repo_commit}"
+            )
+        self.model_manifest["repo_url"] = published_repo_url
+        self.model_manifest["repo_commit"] = published_repo_commit
         self.manifest_compliance = evaluate_manifest_compliance(self.model_manifest)
         self.manifest_digest = manifest_digest(self.model_manifest)
         self._log_manifest_startup(repo_root)
