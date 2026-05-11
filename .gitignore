@@ -21,9 +21,9 @@ runs/
 output.png
 .vscode/*
 flightplans/*
-# model/*
+model/*
 hands_generator/
-# models/*
+models/*
 runs/*
 # C extensions
 *.so

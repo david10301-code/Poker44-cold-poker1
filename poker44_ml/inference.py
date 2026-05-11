@@ -40,6 +40,7 @@ class Poker44Model:
         self.metadata = dict(artifact.get("metadata") or {})
         self.score_quantiles = dict(self.metadata.get("score_quantiles") or {})
         self.score_remap = dict(self.metadata.get("score_remap") or {})
+        self.probability_calibrator = artifact.get("probability_calibrator")
         self.task_type = str(
             self.metadata.get(
                 "task_type",
@@ -141,6 +142,18 @@ class Poker44Model:
                     / max(len(per_model_scores), 1)
                 )
             )
+        if self.probability_calibrator is not None and hasattr(
+            self.probability_calibrator, "transform"
+        ):
+            calibrated = self.probability_calibrator.transform(averaged)
+            return [round(self._clamp01(value), 6) for value in calibrated]
+        if self.probability_calibrator is not None and hasattr(
+            self.probability_calibrator, "predict_proba"
+        ):
+            calibrated = self.probability_calibrator.predict_proba(
+                [[float(value)] for value in averaged]
+            )
+            return [round(self._clamp01(row[1]), 6) for row in calibrated]
         return [round(value, 6) for value in self._apply_supervised_score_remap(averaged)]
 
     def _apply_supervised_score_remap(self, probabilities: list[float]) -> list[float]:

@@ -23,6 +23,8 @@ except ImportError:  # pragma: no cover - surfaced only in incomplete runtime en
 
 try:
     from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import (
         average_precision_score,
         brier_score_loss,
@@ -34,6 +36,8 @@ try:
 except ImportError:  # pragma: no cover - surfaced only in incomplete runtime envs.
     ExtraTreesClassifier = None
     HistGradientBoostingClassifier = None
+    IsotonicRegression = None
+    LogisticRegression = None
     average_precision_score = None
     brier_score_loss = None
     log_loss = None
@@ -66,6 +70,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-depth", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--calibration-size", type=float, default=0.15)
+    parser.add_argument(
+        "--probability-calibration",
+        choices=("isotonic", "sigmoid", "none"),
+        default="sigmoid",
+    )
     parser.add_argument(
         "--output",
         type=str,
@@ -181,6 +190,52 @@ def _apply_score_remap(probabilities: list[float], remap: dict[str, Any] | None)
             mapped = 0.5 + 0.5 * (score - threshold) / (1.0 - threshold)
         adjusted.append(round(_clamp01(mapped), 6))
     return adjusted
+
+
+def _fit_probability_calibrator(
+    labels: list[int],
+    probabilities: list[float],
+    *,
+    method: str,
+) -> object | None:
+    if method == "none":
+        return None
+    if method == "isotonic":
+        if IsotonicRegression is None:
+            raise RuntimeError("scikit-learn isotonic regression is required for calibration.")
+        if not labels or len(set(int(label) for label in labels)) < 2:
+            return None
+        calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+        calibrator.fit(probabilities, labels)
+        return calibrator
+    if method == "sigmoid":
+        if LogisticRegression is None:
+            raise RuntimeError("scikit-learn logistic regression is required for sigmoid calibration.")
+        if not labels or len(set(int(label) for label in labels)) < 2:
+            return None
+        calibrator = LogisticRegression(
+            solver="lbfgs",
+            random_state=42,
+        )
+        calibrator.fit([[float(value)] for value in probabilities], labels)
+        return calibrator
+    return None
+
+
+def _apply_probability_calibrator(
+    probabilities: list[float],
+    calibrator: object | None,
+) -> list[float]:
+    if not probabilities or calibrator is None:
+        return [_clamp01(value) for value in probabilities]
+    if hasattr(calibrator, "transform"):
+        return [round(_clamp01(value), 6) for value in calibrator.transform(probabilities)]
+    if hasattr(calibrator, "predict_proba"):
+        return [
+            round(_clamp01(row[1]), 6)
+            for row in calibrator.predict_proba([[float(value)] for value in probabilities])
+        ]
+    return [_clamp01(value) for value in probabilities]
 
 
 def _binary_metrics(labels: list[int], probabilities: list[float]) -> dict[str, float]:
@@ -316,6 +371,8 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     if (
         ExtraTreesClassifier is None
         or HistGradientBoostingClassifier is None
+        or IsotonicRegression is None
+        or LogisticRegression is None
         or average_precision_score is None
         or brier_score_loss is None
         or log_loss is None
@@ -424,10 +481,24 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     models: list[object] = [extra_trees, hist_gradient]
 
     calibration_raw_probabilities = _average_probabilities(models, X_calibration)
-    score_remap = _derive_score_remap(y_calibration, calibration_raw_probabilities)
+    probability_calibrator = _fit_probability_calibrator(
+        y_calibration,
+        calibration_raw_probabilities,
+        method=args.probability_calibration,
+    )
+    score_remap = (
+        {}
+        if probability_calibrator is not None
+        else _derive_score_remap(y_calibration, calibration_raw_probabilities)
+    )
 
     raw_probabilities = _average_probabilities(models, X_test)
-    probabilities = _apply_score_remap(raw_probabilities, score_remap)
+    if probability_calibrator is not None:
+        probabilities = _apply_probability_calibrator(
+            raw_probabilities, probability_calibrator
+        )
+    else:
+        probabilities = _apply_score_remap(raw_probabilities, score_remap)
     clipped = [_clip_prob(value) for value in probabilities]
     metrics = _binary_metrics(y_test, probabilities)
     metrics["roc_auc"] = roc_auc_score(y_test, probabilities)
@@ -458,6 +529,9 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         **_repo_metadata(),
         "feature_schema_hash": _feature_schema_hash(feature_names),
         "score_remap": score_remap,
+        "probability_calibration": (
+            args.probability_calibration if probability_calibrator is not None else "none"
+        ),
         **split_info,
         "benchmark_paths": [str(path) for path in benchmark_paths],
         "benchmark_file_count": float(len(benchmark_paths)),
@@ -473,6 +547,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "max_depth": float(args.max_depth),
         "learning_rate": float(args.learning_rate),
         "calibration_size": float(args.calibration_size),
+        "probability_calibration_enabled": float(1.0 if probability_calibrator is not None else 0.0),
         "chunk_size": float(args.chunk_size),
         "min_chunk_size": float(args.min_chunk_size),
         "stride": float(args.stride),
@@ -486,6 +561,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
             "models": models,
             "feature_names": feature_names,
             "metadata": metadata,
+            "probability_calibrator": probability_calibrator,
         },
         output_path,
     )
