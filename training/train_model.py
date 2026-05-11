@@ -317,10 +317,16 @@ def _enrich_probability_metrics(
     bot_probs = [prob for prob, label in zip(probabilities, labels) if label == 1]
     metrics["human_prob_max"] = max(human_probs) if human_probs else 0.0
     metrics["bot_prob_min"] = min(bot_probs) if bot_probs else 0.0
+    metrics["human_clearance_to_0_5"] = 0.5 - metrics["human_prob_max"]
+    metrics["bot_clearance_to_0_5"] = metrics["bot_prob_min"] - 0.5
     metrics["score_gap_at_0_5"] = (
         metrics["bot_prob_min"] - metrics["human_prob_max"]
         if human_probs and bot_probs
         else 0.0
+    )
+    metrics["threshold_margin_at_0_5"] = min(
+        metrics["human_clearance_to_0_5"],
+        metrics["bot_clearance_to_0_5"],
     )
 
     if raw_probabilities is not None:
@@ -348,6 +354,7 @@ def _candidate_priority(metrics: dict[str, float]) -> tuple[float, ...]:
         float(metrics.get("validator_reward", 0.0)),
         -float(metrics.get("fpr_at_0_5", 1.0)),
         float(metrics.get("recall_at_0_5", 0.0)),
+        float(metrics.get("threshold_margin_at_0_5", -1.0)),
         float(metrics.get("validator_ap_score", 0.0)),
         float(metrics.get("score_gap_at_0_5", 0.0)),
         -float(metrics.get("log_loss", 1e9)),
@@ -750,7 +757,10 @@ def main() -> None:
         "prob_max",
         "human_prob_max",
         "bot_prob_min",
+        "human_clearance_to_0_5",
+        "bot_clearance_to_0_5",
         "score_gap_at_0_5",
+        "threshold_margin_at_0_5",
         "prob_mean",
         "raw_human_prob_max",
         "raw_bot_prob_min",

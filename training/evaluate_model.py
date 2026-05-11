@@ -87,7 +87,10 @@ def _print_metric_block(title: str, metrics: dict[str, float], rows: int) -> Non
         "prob_max",
         "human_prob_max",
         "bot_prob_min",
+        "human_clearance_to_0_5",
+        "bot_clearance_to_0_5",
         "score_gap_at_0_5",
+        "threshold_margin_at_0_5",
         "prob_mean",
     ):
         if key in metrics:
