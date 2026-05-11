@@ -7,6 +7,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+from poker44.score.scoring import reward
 from poker44_ml.inference import Poker44Model
 from training.build_dataset import (
     build_human_chunk_rows,
@@ -72,8 +75,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-size", type=float, default=0.15)
     parser.add_argument(
         "--probability-calibration",
-        choices=("isotonic", "sigmoid", "none"),
-        default="sigmoid",
+        choices=("auto", "isotonic", "sigmoid", "none"),
+        default="auto",
     )
     parser.add_argument(
         "--output",
@@ -258,6 +261,97 @@ def _binary_metrics(labels: list[int], probabilities: list[float]) -> dict[str, 
         "precision_at_0_5": tp / predicted_positive,
         "fpr_at_0_5": fp / negatives,
     }
+
+
+def _validator_reward_metrics(
+    labels: list[int],
+    probabilities: list[float],
+) -> dict[str, float]:
+    if not labels or not probabilities:
+        return {
+            "validator_reward": 0.0,
+            "validator_fpr": 1.0,
+            "validator_bot_recall": 0.0,
+            "validator_ap_score": 0.0,
+            "validator_human_safety_penalty": 0.0,
+            "validator_base_score": 0.0,
+        }
+
+    reward_value, details = reward(
+        np.asarray(probabilities, dtype=float),
+        np.asarray(labels, dtype=int),
+    )
+    return {
+        "validator_reward": float(reward_value),
+        "validator_fpr": float(details.get("fpr", 1.0)),
+        "validator_bot_recall": float(details.get("bot_recall", 0.0)),
+        "validator_ap_score": float(details.get("ap_score", 0.0)),
+        "validator_human_safety_penalty": float(
+            details.get("human_safety_penalty", 0.0)
+        ),
+        "validator_base_score": float(details.get("base_score", 0.0)),
+    }
+
+
+def _enrich_probability_metrics(
+    labels: list[int],
+    probabilities: list[float],
+    *,
+    raw_probabilities: list[float] | None = None,
+) -> dict[str, float]:
+    clipped = [_clip_prob(value) for value in probabilities]
+    metrics = _binary_metrics(labels, probabilities)
+    metrics["roc_auc"] = roc_auc_score(labels, probabilities)
+    metrics["pr_auc"] = average_precision_score(labels, probabilities)
+    metrics["log_loss"] = log_loss(labels, clipped)
+    metrics["brier_score"] = brier_score_loss(labels, probabilities)
+    metrics["mcc_at_0_5"] = matthews_corrcoef(
+        labels, [1 if prob >= 0.5 else 0 for prob in probabilities]
+    )
+    metrics.update(_validator_reward_metrics(labels, probabilities))
+    metrics["prob_min"] = min(probabilities) if probabilities else 0.0
+    metrics["prob_max"] = max(probabilities) if probabilities else 0.0
+    metrics["prob_mean"] = sum(probabilities) / max(len(probabilities), 1)
+
+    human_probs = [prob for prob, label in zip(probabilities, labels) if label == 0]
+    bot_probs = [prob for prob, label in zip(probabilities, labels) if label == 1]
+    metrics["human_prob_max"] = max(human_probs) if human_probs else 0.0
+    metrics["bot_prob_min"] = min(bot_probs) if bot_probs else 0.0
+    metrics["score_gap_at_0_5"] = (
+        metrics["bot_prob_min"] - metrics["human_prob_max"]
+        if human_probs and bot_probs
+        else 0.0
+    )
+
+    if raw_probabilities is not None:
+        raw_human_probs = [
+            prob for prob, label in zip(raw_probabilities, labels) if label == 0
+        ]
+        raw_bot_probs = [
+            prob for prob, label in zip(raw_probabilities, labels) if label == 1
+        ]
+        metrics["raw_human_prob_max"] = (
+            max(raw_human_probs) if raw_human_probs else 0.0
+        )
+        metrics["raw_bot_prob_min"] = min(raw_bot_probs) if raw_bot_probs else 0.0
+        metrics["raw_score_gap_at_0_5"] = (
+            metrics["raw_bot_prob_min"] - metrics["raw_human_prob_max"]
+            if raw_human_probs and raw_bot_probs
+            else 0.0
+        )
+
+    return metrics
+
+
+def _candidate_priority(metrics: dict[str, float]) -> tuple[float, ...]:
+    return (
+        float(metrics.get("validator_reward", 0.0)),
+        -float(metrics.get("fpr_at_0_5", 1.0)),
+        float(metrics.get("recall_at_0_5", 0.0)),
+        float(metrics.get("validator_ap_score", 0.0)),
+        float(metrics.get("score_gap_at_0_5", 0.0)),
+        -float(metrics.get("log_loss", 1e9)),
+    )
 
 
 def _overfit_risk_warnings(
@@ -480,48 +574,77 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     hist_gradient.fit(X_train, y_train, sample_weight=sample_weight)
     models: list[object] = [extra_trees, hist_gradient]
 
-    calibration_raw_probabilities = _average_probabilities(models, X_calibration)
-    probability_calibrator = _fit_probability_calibrator(
-        y_calibration,
-        calibration_raw_probabilities,
-        method=args.probability_calibration,
-    )
-    score_remap = (
-        {}
-        if probability_calibrator is not None
-        else _derive_score_remap(y_calibration, calibration_raw_probabilities)
-    )
-
     raw_probabilities = _average_probabilities(models, X_test)
-    if probability_calibrator is not None:
-        probabilities = _apply_probability_calibrator(
-            raw_probabilities, probability_calibrator
-        )
-    else:
-        probabilities = _apply_score_remap(raw_probabilities, score_remap)
-    clipped = [_clip_prob(value) for value in probabilities]
-    metrics = _binary_metrics(y_test, probabilities)
-    metrics["roc_auc"] = roc_auc_score(y_test, probabilities)
-    metrics["pr_auc"] = average_precision_score(y_test, probabilities)
-    metrics["log_loss"] = log_loss(y_test, clipped)
-    metrics["brier_score"] = brier_score_loss(y_test, probabilities)
-    metrics["mcc_at_0_5"] = matthews_corrcoef(
-        y_test, [1 if prob >= 0.5 else 0 for prob in probabilities]
+    calibration_raw_probabilities = _average_probabilities(models, X_calibration)
+
+    calibration_methods = (
+        ["none", "sigmoid", "isotonic"]
+        if args.probability_calibration == "auto"
+        else [args.probability_calibration]
     )
-    metrics["prob_min"] = min(probabilities) if probabilities else 0.0
-    metrics["prob_max"] = max(probabilities) if probabilities else 0.0
-    human_probs = [prob for prob, label in zip(probabilities, y_test) if label == 0]
-    bot_probs = [prob for prob, label in zip(probabilities, y_test) if label == 1]
-    metrics["human_prob_max"] = max(human_probs) if human_probs else 0.0
-    metrics["bot_prob_min"] = min(bot_probs) if bot_probs else 0.0
-    raw_human_probs = [
-        prob for prob, label in zip(raw_probabilities, y_test) if label == 0
-    ]
-    raw_bot_probs = [
-        prob for prob, label in zip(raw_probabilities, y_test) if label == 1
-    ]
-    metrics["raw_human_prob_max"] = max(raw_human_probs) if raw_human_probs else 0.0
-    metrics["raw_bot_prob_min"] = min(raw_bot_probs) if raw_bot_probs else 0.0
+    candidate_results: list[dict[str, Any]] = []
+    for method in calibration_methods:
+        probability_calibrator = _fit_probability_calibrator(
+            y_calibration,
+            calibration_raw_probabilities,
+            method=method,
+        )
+        score_remap = (
+            {}
+            if probability_calibrator is not None
+            else _derive_score_remap(y_calibration, calibration_raw_probabilities)
+        )
+
+        if probability_calibrator is not None:
+            calibration_probabilities = _apply_probability_calibrator(
+                calibration_raw_probabilities, probability_calibrator
+            )
+            probabilities = _apply_probability_calibrator(
+                raw_probabilities, probability_calibrator
+            )
+            selected_method = method
+        else:
+            calibration_probabilities = _apply_score_remap(
+                calibration_raw_probabilities, score_remap
+            )
+            probabilities = _apply_score_remap(raw_probabilities, score_remap)
+            selected_method = "none"
+
+        calibration_metrics = _enrich_probability_metrics(
+            y_calibration,
+            calibration_probabilities,
+            raw_probabilities=calibration_raw_probabilities,
+        )
+        metrics = _enrich_probability_metrics(
+            y_test,
+            probabilities,
+            raw_probabilities=raw_probabilities,
+        )
+        candidate_results.append(
+            {
+                "method": selected_method,
+                "requested_method": method,
+                "probability_calibrator": probability_calibrator,
+                "score_remap": score_remap,
+                "probabilities": probabilities,
+                "metrics": metrics,
+                "calibration_metrics": calibration_metrics,
+            }
+        )
+
+    best_candidate = max(
+        candidate_results,
+        key=lambda candidate: (
+            _candidate_priority(candidate["calibration_metrics"]),
+            _candidate_priority(candidate["metrics"]),
+        ),
+    )
+    probability_calibrator = best_candidate["probability_calibrator"]
+    score_remap = best_candidate["score_remap"]
+    probabilities = best_candidate["probabilities"]
+    metrics = dict(best_candidate["metrics"])
+    selected_calibration = str(best_candidate["method"])
+    calibration_selection_metrics = dict(best_candidate["calibration_metrics"])
 
     metadata = {
         "framework": "sklearn.ExtraTreesClassifier+sklearn.HistGradientBoostingClassifier",
@@ -529,9 +652,8 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         **_repo_metadata(),
         "feature_schema_hash": _feature_schema_hash(feature_names),
         "score_remap": score_remap,
-        "probability_calibration": (
-            args.probability_calibration if probability_calibrator is not None else "none"
-        ),
+        "probability_calibration": selected_calibration,
+        "probability_calibration_requested": args.probability_calibration,
         **split_info,
         "benchmark_paths": [str(path) for path in benchmark_paths],
         "benchmark_file_count": float(len(benchmark_paths)),
@@ -548,6 +670,15 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "learning_rate": float(args.learning_rate),
         "calibration_size": float(args.calibration_size),
         "probability_calibration_enabled": float(1.0 if probability_calibrator is not None else 0.0),
+        "calibration_selection_reward": float(
+            calibration_selection_metrics.get("validator_reward", 0.0)
+        ),
+        "calibration_selection_fpr_at_0_5": float(
+            calibration_selection_metrics.get("fpr_at_0_5", 1.0)
+        ),
+        "calibration_selection_recall_at_0_5": float(
+            calibration_selection_metrics.get("recall_at_0_5", 0.0)
+        ),
         "chunk_size": float(args.chunk_size),
         "min_chunk_size": float(args.min_chunk_size),
         "stride": float(args.stride),
@@ -568,9 +699,9 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
 
     loaded = Poker44Model(output_path)
     latency_chunks = list(chunks_test[: min(4, len(chunks_test))])
-    latency = loaded.benchmark_latency(latency_chunks or benchmark_chunks[:2])
+    latency = loaded.benchmark_latency(latency_chunks or chunks_test[:2])
     metrics["latency_per_chunk_ms"] = latency["latency_per_chunk_ms"]
-    metrics["prob_mean"] = sum(probabilities) / max(len(probabilities), 1)
+    metrics["selected_probability_calibration"] = selected_calibration
     metadata["overfit_warnings"] = _overfit_risk_warnings(
         metrics=metrics,
         metadata=metadata,
@@ -593,7 +724,8 @@ def main() -> None:
         f"aux_human_rows={metadata.get('aux_human_rows')} "
         f"n_estimators={metadata.get('n_estimators')} "
         f"max_depth={metadata.get('max_depth')} "
-        f"learning_rate={metadata.get('learning_rate')}"
+        f"learning_rate={metadata.get('learning_rate')} "
+        f"probability_calibration={metadata.get('probability_calibration')}"
     )
     for key in (
         "roc_auc",
@@ -601,6 +733,12 @@ def main() -> None:
         "log_loss",
         "brier_score",
         "mcc_at_0_5",
+        "validator_reward",
+        "validator_fpr",
+        "validator_bot_recall",
+        "validator_ap_score",
+        "validator_human_safety_penalty",
+        "validator_base_score",
         "recall_at_0_5",
         "precision_at_0_5",
         "fpr_at_0_5",
@@ -612,9 +750,11 @@ def main() -> None:
         "prob_max",
         "human_prob_max",
         "bot_prob_min",
+        "score_gap_at_0_5",
         "prob_mean",
         "raw_human_prob_max",
         "raw_bot_prob_min",
+        "raw_score_gap_at_0_5",
         "latency_per_chunk_ms",
     ):
         print(f"{key}={float(metrics.get(key, 0.0)):.6f}")

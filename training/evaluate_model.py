@@ -7,22 +7,7 @@ from typing import Any
 
 from poker44_ml.inference import Poker44Model
 from training.build_dataset import load_benchmark_examples, resolve_benchmark_paths
-from training.train_model import _binary_metrics, _clip_prob
-
-try:
-    from sklearn.metrics import (
-        average_precision_score,
-        brier_score_loss,
-        log_loss,
-        matthews_corrcoef,
-        roc_auc_score,
-    )
-except ImportError:  # pragma: no cover - surfaced only in incomplete runtime envs.
-    average_precision_score = None
-    brier_score_loss = None
-    log_loss = None
-    matthews_corrcoef = None
-    roc_auc_score = None
+from training.train_model import _enrich_probability_metrics
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,30 +44,7 @@ def _evaluate_examples(
     chunks = [list(example["chunk"]) for example in examples]
     labels = [int(example["label"]) for example in examples]
     probabilities = model.predict_chunk_scores(chunks)
-    clipped = [_clip_prob(value) for value in probabilities]
-
-    metrics = _binary_metrics(labels, probabilities)
-    if average_precision_score is not None:
-        metrics["pr_auc"] = float(average_precision_score(labels, probabilities))
-    if roc_auc_score is not None:
-        metrics["roc_auc"] = float(roc_auc_score(labels, probabilities))
-    if log_loss is not None:
-        metrics["log_loss"] = float(log_loss(labels, clipped))
-    if brier_score_loss is not None:
-        metrics["brier_score"] = float(brier_score_loss(labels, probabilities))
-    if matthews_corrcoef is not None:
-        metrics["mcc_at_0_5"] = float(
-            matthews_corrcoef(labels, [1 if prob >= 0.5 else 0 for prob in probabilities])
-        )
-
-    metrics["prob_min"] = min(probabilities) if probabilities else 0.0
-    metrics["prob_max"] = max(probabilities) if probabilities else 0.0
-    metrics["prob_mean"] = sum(probabilities) / max(len(probabilities), 1)
-    human_probs = [prob for prob, label in zip(probabilities, labels) if label == 0]
-    bot_probs = [prob for prob, label in zip(probabilities, labels) if label == 1]
-    metrics["human_prob_max"] = max(human_probs) if human_probs else 0.0
-    metrics["bot_prob_min"] = min(bot_probs) if bot_probs else 0.0
-    return metrics
+    return _enrich_probability_metrics(labels, probabilities)
 
 
 def _filter_examples(
@@ -108,6 +70,12 @@ def _print_metric_block(title: str, metrics: dict[str, float], rows: int) -> Non
         "log_loss",
         "brier_score",
         "mcc_at_0_5",
+        "validator_reward",
+        "validator_fpr",
+        "validator_bot_recall",
+        "validator_ap_score",
+        "validator_human_safety_penalty",
+        "validator_base_score",
         "recall_at_0_5",
         "precision_at_0_5",
         "fpr_at_0_5",
@@ -119,6 +87,7 @@ def _print_metric_block(title: str, metrics: dict[str, float], rows: int) -> Non
         "prob_max",
         "human_prob_max",
         "bot_prob_min",
+        "score_gap_at_0_5",
         "prob_mean",
     ):
         if key in metrics:
