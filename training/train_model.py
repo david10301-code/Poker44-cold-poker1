@@ -12,7 +12,7 @@ import numpy as np
 from poker44.score.scoring import reward
 from poker44_ml.inference import Poker44Model
 from training.build_dataset import (
-    build_human_chunk_rows,
+    build_human_chunk_examples,
     load_benchmark_examples,
     load_json_or_gz,
     resolve_benchmark_paths,
@@ -60,7 +60,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--human-path", type=str, default=None)
     parser.add_argument("--enable-aux-human", action="store_true")
     parser.add_argument("--aux-human-weight", type=float, default=0.35)
-    parser.add_argument("--max-aux-human-chunks", type=int, default=160)
+    parser.add_argument("--max-aux-human-chunks", type=int, default=640)
+    parser.add_argument("--aux-human-calibration-fraction", type=float, default=0.2)
+    parser.add_argument("--shuffle-aux-human", action="store_true")
     parser.add_argument("--chunk-size", type=int, default=80)
     parser.add_argument("--min-chunk-size", type=int, default=40)
     parser.add_argument("--stride", type=int, default=40)
@@ -720,41 +722,69 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
             stratify=fit_labels,
         )
 
-    X_train_base = _build_feature_matrix(
-        [example["features"] for example in fit_examples], feature_names
-    )
-    y_train_base = [int(example["label"]) for example in fit_examples]
-    X_calibration = _build_feature_matrix(
-        [example["features"] for example in calibration_examples], feature_names
-    )
-    y_calibration = [int(example["label"]) for example in calibration_examples]
-
-    X_train = list(X_train_base)
-    y_train = list(y_train_base)
-    sample_weight = [1.0 for _ in X_train]
     aux_human_rows_added = 0
+    aux_human_calibration_rows = 0
+    aux_train_examples: list[dict[str, Any]] = []
+    aux_calibration_examples: list[dict[str, Any]] = []
 
     if args.enable_aux_human:
         human_path = resolve_human_path(args.human_path)
         human_hands = load_json_or_gz(human_path)
-        aux_rows = build_human_chunk_rows(
+        aux_examples = build_human_chunk_examples(
             human_hands=human_hands,
             chunk_size=args.chunk_size,
             min_chunk_size=args.min_chunk_size,
             stride=args.stride,
             repeats=args.repeats,
             seed=args.seed,
-            shuffle=False,
+            shuffle=bool(args.shuffle_aux_human),
+            source_path=str(human_path),
         )
-        if args.max_aux_human_chunks > 0 and len(aux_rows) > args.max_aux_human_chunks:
-            picker = list(aux_rows)
+        if args.max_aux_human_chunks > 0 and len(aux_examples) > args.max_aux_human_chunks:
+            picker = list(aux_examples)
             rng = __import__("random").Random(args.seed)
-            aux_rows = rng.sample(picker, args.max_aux_human_chunks)
-        X_aux = _build_feature_matrix(aux_rows, feature_names)
+            aux_examples = rng.sample(picker, args.max_aux_human_chunks)
+
+        calibration_fraction = min(
+            max(float(args.aux_human_calibration_fraction), 0.0),
+            0.5,
+        )
+        if len(aux_examples) >= 2 and calibration_fraction > 0.0:
+            aux_train_examples, aux_calibration_examples = train_test_split(
+                aux_examples,
+                test_size=calibration_fraction,
+                random_state=args.seed,
+                shuffle=True,
+            )
+        else:
+            aux_train_examples = list(aux_examples)
+        aux_human_rows_added = len(aux_train_examples)
+        aux_human_calibration_rows = len(aux_calibration_examples)
+
+    X_train_base = _build_feature_matrix(
+        [example["features"] for example in fit_examples], feature_names
+    )
+    y_train_base = [int(example["label"]) for example in fit_examples]
+    X_calibration = _build_feature_matrix(
+        [example["features"] for example in calibration_examples + aux_calibration_examples],
+        feature_names,
+    )
+    y_calibration = [
+        int(example["label"])
+        for example in calibration_examples + aux_calibration_examples
+    ]
+
+    X_train = list(X_train_base)
+    y_train = list(y_train_base)
+    sample_weight = [1.0 for _ in X_train]
+    if aux_train_examples:
+        X_aux = _build_feature_matrix(
+            [example["features"] for example in aux_train_examples],
+            feature_names,
+        )
         X_train.extend(X_aux)
         y_train.extend([0 for _ in X_aux])
         sample_weight.extend([float(args.aux_human_weight) for _ in X_aux])
-        aux_human_rows_added = len(X_aux)
 
     extra_trees = ExtraTreesClassifier(
         n_estimators=args.n_estimators,
@@ -895,7 +925,10 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "test_rows": float(len(X_test)),
         "calibration_rows": float(len(X_calibration)),
         "aux_human_rows": float(aux_human_rows_added),
+        "aux_human_calibration_rows": float(aux_human_calibration_rows),
         "aux_human_weight": float(args.aux_human_weight),
+        "aux_human_calibration_fraction": float(args.aux_human_calibration_fraction),
+        "shuffle_aux_human": float(1.0 if args.shuffle_aux_human else 0.0),
         "n_estimators": float(args.n_estimators),
         "max_depth": float(args.max_depth),
         "learning_rate": float(args.learning_rate),

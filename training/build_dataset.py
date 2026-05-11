@@ -174,3 +174,54 @@ def build_human_chunk_rows(
                 continue
             rows.append(_chunk_row(chunk))
     return rows
+
+
+def build_human_chunk_examples(
+    human_hands: list[dict[str, Any]],
+    *,
+    chunk_size: int = 80,
+    min_chunk_size: int | None = None,
+    stride: int | None = None,
+    repeats: int = 1,
+    seed: int = 42,
+    shuffle: bool = False,
+    source_path: str = "",
+) -> list[dict[str, Any]]:
+    minimum = min_chunk_size if min_chunk_size is not None else max(20, chunk_size // 2)
+    stride = stride if stride is not None else max(1, chunk_size // 2)
+    hands = list(human_hands)
+    examples: list[dict[str, Any]] = []
+
+    if shuffle:
+        random.Random(seed).shuffle(hands)
+
+    phase_count = max(1, repeats)
+    phase_step = max(1, stride // phase_count)
+    seen_offsets: set[int] = set()
+
+    for repeat_index in range(phase_count):
+        if shuffle and repeat_index:
+            random.Random(seed + repeat_index).shuffle(hands)
+            start_offset = 0
+        else:
+            start_offset = min(stride - 1, repeat_index * phase_step)
+        if start_offset in seen_offsets and not shuffle:
+            continue
+        seen_offsets.add(start_offset)
+        for item_index, start_index in enumerate(range(start_offset, len(hands), stride)):
+            chunk = hands[start_index : start_index + chunk_size]
+            if len(chunk) < minimum:
+                continue
+            examples.append(
+                {
+                    "chunk": list(chunk),
+                    "label": 0,
+                    "source_date": "aux_human",
+                    "group_id": f"aux_human_{repeat_index}",
+                    "group_hash": "",
+                    "item_index": item_index,
+                    "source_path": source_path,
+                    "features": _chunk_row(chunk),
+                }
+            )
+    return examples
