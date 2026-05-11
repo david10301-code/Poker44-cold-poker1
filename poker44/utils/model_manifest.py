@@ -18,7 +18,10 @@ MIN_REQUIRED_MANIFEST_FIELDS = [
     "training_data_statement",
     "private_data_attestation",
 ]
-REFERENCE_MINER_MODEL_NAME = "poker44_benchmark_supervised"
+REFERENCE_MINER_MODEL_NAMES = {
+    "poker44-reference-heuristic",
+    "poker44_benchmark_supervised",
+}
 REFERENCE_REPO_URL = "https://github.com/Poker44/Poker44-subnet"
 GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
@@ -181,7 +184,7 @@ def _uses_reference_repo(manifest: Mapping[str, Any]) -> bool:
 
 
 def _is_reference_miner_manifest(manifest: Mapping[str, Any]) -> bool:
-    return str(manifest.get("model_name", "")).strip() == REFERENCE_MINER_MODEL_NAME
+    return str(manifest.get("model_name", "")).strip() in REFERENCE_MINER_MODEL_NAMES
 
 
 def _has_implementation_files(manifest: Mapping[str, Any]) -> bool:

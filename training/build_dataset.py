@@ -14,7 +14,10 @@ DEFAULT_HUMAN_PATH = (
     REPO_ROOT / "hands_generator" / "human_hands" / "poker_hands_combined.json.gz"
 )
 DEFAULT_BENCHMARK_DIR = REPO_ROOT / "hands_generator" / "evaluation_datas"
-DEFAULT_BENCHMARK_PATTERN = "training_benchmark_*.txt"
+DEFAULT_BENCHMARK_PATTERNS = (
+    "training_benchmark.txt",
+    "training_benchmark_*.txt",
+)
 
 
 def load_json_or_gz(path: str | Path) -> Any:
@@ -38,17 +41,24 @@ def resolve_benchmark_paths(preferred: str | Path | None) -> list[Path]:
     if preferred:
         candidate = Path(preferred)
         if candidate.is_dir():
-            paths = sorted(candidate.glob(DEFAULT_BENCHMARK_PATTERN))
+            paths = []
+            for pattern in DEFAULT_BENCHMARK_PATTERNS:
+                paths.extend(sorted(candidate.glob(pattern)))
         else:
             paths = [candidate] if candidate.exists() else []
     else:
-        paths = sorted(DEFAULT_BENCHMARK_DIR.glob(DEFAULT_BENCHMARK_PATTERN))
+        paths = []
+        for pattern in DEFAULT_BENCHMARK_PATTERNS:
+            paths.extend(sorted(DEFAULT_BENCHMARK_DIR.glob(pattern)))
 
-    existing = [path for path in paths if path.exists()]
+    existing = sorted({path for path in paths if path.exists()})
     if existing:
         return existing
 
-    target = str(preferred) if preferred else str(DEFAULT_BENCHMARK_DIR / DEFAULT_BENCHMARK_PATTERN)
+    target = str(preferred) if preferred else ", ".join(
+        str(DEFAULT_BENCHMARK_DIR / pattern)
+        for pattern in DEFAULT_BENCHMARK_PATTERNS
+    )
     raise FileNotFoundError(f"No benchmark files found for: {target}")
 
 

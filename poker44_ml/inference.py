@@ -39,7 +39,10 @@ class Poker44Model:
         self.feature_names = list(artifact.get("feature_names") or [])
         self.metadata = dict(artifact.get("metadata") or {})
         self.score_quantiles = dict(self.metadata.get("score_quantiles") or {})
+        self.score_expansion = dict(self.metadata.get("score_expansion") or {})
         self.score_remap = dict(self.metadata.get("score_remap") or {})
+        self.ensemble_combiner = str(self.metadata.get("ensemble_combiner", "average"))
+        self.ensemble_max_blend = float(self.metadata.get("ensemble_max_blend", 0.75))
         self.probability_calibrator = artifact.get("probability_calibrator")
         self.task_type = str(
             self.metadata.get(
@@ -134,36 +137,52 @@ class Poker44Model:
             predictions = model.predict(rows)
             per_model_scores.append([float(value) for value in predictions])
 
-        averaged: list[float] = []
+        combined: list[float] = []
+        max_blend = min(max(float(self.ensemble_max_blend), 0.0), 1.0)
         for index in range(len(rows)):
-            averaged.append(
-                self._clamp01(
-                    sum(scores[index] for scores in per_model_scores)
-                    / max(len(per_model_scores), 1)
-                )
-            )
+            values = [scores[index] for scores in per_model_scores]
+            average_score = sum(values) / max(len(values), 1)
+            max_score = max(values)
+            if self.ensemble_combiner == "max":
+                score = max_score
+            elif self.ensemble_combiner == "avg_max_blend":
+                score = (1.0 - max_blend) * average_score + max_blend * max_score
+            else:
+                score = average_score
+            combined.append(self._clamp01(score))
         if self.probability_calibrator is not None and hasattr(
             self.probability_calibrator, "transform"
         ):
-            calibrated = self.probability_calibrator.transform(averaged)
-            return [round(self._clamp01(value), 6) for value in calibrated]
+            calibrated = self.probability_calibrator.transform(combined)
+            return [
+                round(value, 6)
+                for value in self._apply_supervised_score_remap(
+                    [self._clamp01(value) for value in calibrated]
+                )
+            ]
         if self.probability_calibrator is not None and hasattr(
             self.probability_calibrator, "predict_proba"
         ):
             calibrated = self.probability_calibrator.predict_proba(
-                [[float(value)] for value in averaged]
+                [[float(value)] for value in combined]
             )
-            return [round(self._clamp01(row[1]), 6) for row in calibrated]
-        return [round(value, 6) for value in self._apply_supervised_score_remap(averaged)]
+            return [
+                round(value, 6)
+                for value in self._apply_supervised_score_remap(
+                    [self._clamp01(row[1]) for row in calibrated]
+                )
+            ]
+        return [round(value, 6) for value in self._apply_supervised_score_remap(combined)]
 
     def _apply_supervised_score_remap(self, probabilities: list[float]) -> list[float]:
-        if not probabilities or not self.score_remap:
-            return [self._clamp01(value) for value in probabilities]
+        expanded = self._apply_supervised_score_expansion(probabilities)
+        if not expanded or not self.score_remap:
+            return [self._clamp01(value) for value in expanded]
 
         threshold = float(self.score_remap.get("threshold", 0.5))
         threshold = min(max(threshold, 1e-6), 1.0 - 1e-6)
         adjusted: list[float] = []
-        for value in probabilities:
+        for value in expanded:
             score = self._clamp01(value)
             if score <= threshold:
                 mapped = 0.5 * score / threshold
@@ -171,6 +190,21 @@ class Poker44Model:
                 mapped = 0.5 + 0.5 * (score - threshold) / (1.0 - threshold)
             adjusted.append(self._clamp01(mapped))
         return adjusted
+
+    def _apply_supervised_score_expansion(self, probabilities: list[float]) -> list[float]:
+        if not probabilities or not self.score_expansion:
+            return [self._clamp01(value) for value in probabilities]
+        try:
+            low = float(self.score_expansion.get("low", 0.0))
+            high = float(self.score_expansion.get("high", 1.0))
+        except (TypeError, ValueError):
+            return [self._clamp01(value) for value in probabilities]
+        if high <= low + 1e-9:
+            return [self._clamp01(value) for value in probabilities]
+        return [
+            self._clamp01((float(value) - low) / (high - low))
+            for value in probabilities
+        ]
 
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:

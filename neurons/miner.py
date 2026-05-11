@@ -69,6 +69,16 @@ class Miner(BaseMinerNeuron):
             os.getenv("POKER44_LOG_QUERY_PREVIEW", "0").strip().lower()
             in {"1", "true", "yes", "on"}
         )
+        self.batch_score_normalization = (
+            os.getenv("POKER44_BATCH_SCORE_NORMALIZATION", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.batch_normalization_min_chunks = max(
+            4, int(os.getenv("POKER44_BATCH_NORMALIZATION_MIN_CHUNKS", "12"))
+        )
+        self.batch_normalization_min_spread = max(
+            0.0, float(os.getenv("POKER44_BATCH_NORMALIZATION_MIN_SPREAD", "0.18"))
+        )
         self.model_path = Path(
             os.getenv(
                 "POKER44_MODEL_PATH",
@@ -234,7 +244,10 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(
             "Runtime config | "
             f"max_hands_per_chunk_eval={self.max_hands_per_chunk_eval} "
-            f"query_log_preview={self.query_log_preview}"
+            f"query_log_preview={self.query_log_preview} "
+            f"batch_score_normalization={self.batch_score_normalization} "
+            f"batch_normalization_min_chunks={self.batch_normalization_min_chunks} "
+            f"batch_normalization_min_spread={self.batch_normalization_min_spread}"
         )
         if self.predictor is not None:
             artifact_commit = str(self.predictor.metadata.get("repo_commit", ""))
@@ -287,6 +300,30 @@ class Miner(BaseMinerNeuron):
             for index in range(limit)
         }
         return [chunk[index] for index in sorted(indices)]
+
+    def _normalize_batch_scores(self, scores: list[float]) -> tuple[list[float], bool]:
+        if not self.batch_score_normalization:
+            return scores, False
+        if len(scores) < self.batch_normalization_min_chunks:
+            return scores, False
+
+        cleaned = [self._clamp01(score) for score in scores]
+        score_min = min(cleaned)
+        score_max = max(cleaned)
+        score_spread = score_max - score_min
+        crosses_threshold = score_min < 0.5 < score_max
+        has_enough_spread = score_spread >= self.batch_normalization_min_spread
+        if crosses_threshold and has_enough_spread:
+            return cleaned, False
+
+        if score_spread <= 1e-9:
+            return cleaned, False
+
+        normalized = [
+            round(0.05 + 0.90 * ((score - score_min) / score_spread), 6)
+            for score in cleaned
+        ]
+        return normalized, True
 
     @classmethod
     def _score_hand(cls, hand: dict) -> tuple[float, dict[str, float]]:
@@ -407,6 +444,8 @@ class Miner(BaseMinerNeuron):
                 scores = [self.score_chunk(chunk) for chunk in chunks]
         else:
             scores = [self.score_chunk(chunk) for chunk in chunks]
+        raw_score_range = [min(scores), max(scores)] if scores else [0.0, 0.0]
+        scores, normalized_scores = self._normalize_batch_scores(scores)
         synapse.risk_scores = scores
         synapse.predictions = [score >= 0.5 for score in scores]
         synapse.model_manifest = dict(self.model_manifest)
@@ -421,7 +460,9 @@ class Miner(BaseMinerNeuron):
             f"per_chunk_ms={per_chunk_ms:.2f} "
             f"per_hand_ms={per_hand_ms:.2f} "
             f"chunk_size_range={ [min(chunk_sizes), max(chunk_sizes)] if chunk_sizes else [0, 0] } "
+            f"raw_score_range={raw_score_range} "
             f"score_range={ [min(scores), max(scores)] if scores else [0.0, 0.0] }"
+            f" batch_normalized={normalized_scores}"
         )
         if self.query_log_preview:
             message += (

@@ -71,8 +71,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-estimators", type=int, default=300)
     parser.add_argument("--max-depth", type=int, default=5)
+    parser.add_argument("--extra-trees-min-samples-leaf", type=int, default=2)
+    parser.add_argument("--hist-min-samples-leaf", type=int, default=5)
+    parser.add_argument(
+        "--ensemble-combiner",
+        choices=("average", "max", "avg_max_blend"),
+        default="average",
+    )
+    parser.add_argument("--ensemble-max-blend", type=float, default=0.75)
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--calibration-size", type=float, default=0.15)
+    parser.add_argument(
+        "--threshold-gap-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "When calibration humans and bots have a clean score gap, place the "
+            "validator threshold this fraction into that gap from the human side. "
+            "Lower values reduce false negatives while preserving calibration FPR."
+        ),
+    )
+    parser.add_argument(
+        "--target-fpr",
+        type=float,
+        default=0.05,
+        help=(
+            "Maximum calibration false-positive rate allowed at score threshold 0.5. "
+            "Poker44 live rewards hard-fail at higher human FPR, so the default "
+            "keeps a conservative margin."
+        ),
+    )
     parser.add_argument(
         "--probability-calibration",
         choices=("auto", "isotonic", "sigmoid", "none"),
@@ -127,24 +155,80 @@ def _feature_schema_hash(feature_names: list[str]) -> str:
     return hashlib.sha256(joined).hexdigest()
 
 
-def _average_probabilities(models: list[object], rows: list[list[float]]) -> list[float]:
+def _combine_probabilities(
+    models: list[object],
+    rows: list[list[float]],
+    *,
+    combiner: str = "average",
+    max_blend: float = 0.75,
+) -> list[float]:
     if not rows:
         return []
     per_model_scores: list[list[float]] = []
     for model in models:
         probabilities = model.predict_proba(rows)
         per_model_scores.append([float(row[1]) for row in probabilities])
-    averaged: list[float] = []
+    max_blend = min(max(float(max_blend), 0.0), 1.0)
+    combined: list[float] = []
     for index in range(len(rows)):
-        averaged.append(
-            sum(scores[index] for scores in per_model_scores) / max(len(per_model_scores), 1)
-        )
-    return averaged
+        values = [scores[index] for scores in per_model_scores]
+        average_score = sum(values) / max(len(values), 1)
+        max_score = max(values)
+        if combiner == "max":
+            combined.append(max_score)
+        elif combiner == "avg_max_blend":
+            combined.append((1.0 - max_blend) * average_score + max_blend * max_score)
+        else:
+            combined.append(average_score)
+    return combined
+
+
+def _confusion_at_threshold(
+    labels: list[int],
+    probabilities: list[float],
+    threshold: float,
+) -> dict[str, float]:
+    tp = fp = tn = fn = 0
+    for label, probability in zip(labels, probabilities):
+        predicted = float(probability) >= threshold
+        if int(label) == 1 and predicted:
+            tp += 1
+        elif int(label) == 0 and predicted:
+            fp += 1
+        elif int(label) == 0:
+            tn += 1
+        else:
+            fn += 1
+
+    positives = max(tp + fn, 1)
+    negatives = max(tn + fp, 1)
+    return {
+        "tp": float(tp),
+        "fp": float(fp),
+        "tn": float(tn),
+        "fn": float(fn),
+        "fpr": fp / negatives,
+        "bot_recall": tp / positives,
+    }
+
+
+def _candidate_thresholds(probabilities: list[float]) -> list[float]:
+    if not probabilities:
+        return [0.5]
+    ordered = sorted({_clamp01(value) for value in probabilities})
+    candidates = {0.0, 0.5, 1.0}
+    candidates.update(ordered)
+    for low, high in zip(ordered, ordered[1:]):
+        candidates.add((low + high) / 2.0)
+    return sorted(candidates)
 
 
 def _derive_score_remap(
     labels: list[int],
     probabilities: list[float],
+    *,
+    target_fpr: float = 0.05,
+    threshold_gap_fraction: float = 0.25,
 ) -> dict[str, float]:
     negatives = sorted(
         float(prob) for prob, label in zip(probabilities, labels) if int(label) == 0
@@ -155,26 +239,93 @@ def _derive_score_remap(
     if not negatives or not positives:
         return {}
 
+    target_fpr = min(max(float(target_fpr), 0.0), 0.099)
+    ap_score = (
+        float(average_precision_score(labels, probabilities))
+        if average_precision_score is not None and len({int(label) for label in labels}) > 1
+        else 0.0
+    )
+    best: dict[str, float] | None = None
+    for threshold in _candidate_thresholds(probabilities):
+        details = _confusion_at_threshold(labels, probabilities, threshold)
+        if details["fpr"] > target_fpr:
+            continue
+        human_safety_penalty = max(0.0, 1.0 - details["fpr"]) ** 2
+        base_score = 0.65 * ap_score + 0.35 * details["bot_recall"]
+        reward_value = base_score * human_safety_penalty
+        margin_to_fpr_cap = target_fpr - details["fpr"]
+        candidate = {
+            "threshold": float(threshold),
+            "reward": float(reward_value),
+            "fpr": float(details["fpr"]),
+            "bot_recall": float(details["bot_recall"]),
+            "ap_score": float(ap_score),
+            "margin_to_fpr_cap": float(margin_to_fpr_cap),
+        }
+        if best is None or (
+            candidate["reward"],
+            candidate["bot_recall"],
+            candidate["margin_to_fpr_cap"],
+            -abs(candidate["threshold"] - 0.5),
+        ) > (
+            best["reward"],
+            best["bot_recall"],
+            best["margin_to_fpr_cap"],
+            -abs(best["threshold"] - 0.5),
+        ):
+            best = candidate
+
+    if best is None:
+        index = min(
+            len(negatives) - 1,
+            max(0, int((1.0 - target_fpr) * len(negatives)) - 1),
+        )
+        threshold = negatives[index] + 1e-6
+        details = _confusion_at_threshold(labels, probabilities, threshold)
+        best = {
+            "threshold": float(threshold),
+            "reward": 0.0,
+            "fpr": float(details["fpr"]),
+            "bot_recall": float(details["bot_recall"]),
+            "ap_score": float(ap_score),
+            "margin_to_fpr_cap": float(target_fpr - details["fpr"]),
+        }
+
     human_upper = negatives[-1]
-    bot_lower_candidates = [value for value in positives if value > human_upper]
+    bot_lower = positives[0]
+    threshold_source = "reward_search"
+    if bot_lower > human_upper:
+        gap_fraction = min(max(float(threshold_gap_fraction), 0.01), 0.95)
+        gap_threshold = human_upper + gap_fraction * (bot_lower - human_upper)
+        gap_details = _confusion_at_threshold(labels, probabilities, gap_threshold)
+        if gap_details["fpr"] <= target_fpr:
+            best = {
+                "threshold": float(gap_threshold),
+                "reward": float(best.get("reward", 0.0)),
+                "fpr": float(gap_details["fpr"]),
+                "bot_recall": float(gap_details["bot_recall"]),
+                "ap_score": float(ap_score),
+                "margin_to_fpr_cap": float(target_fpr - gap_details["fpr"]),
+            }
+            threshold_source = "clean_gap_fraction"
+
+    bot_lower_candidates = [value for value in positives if value >= best["threshold"]]
     if bot_lower_candidates:
         bot_lower = bot_lower_candidates[0]
-        gap = max(bot_lower - human_upper, 1e-6)
-        threshold = human_upper + 0.15 * gap
-        threshold = min(
-            max(threshold, human_upper + 1e-6),
-            bot_lower - 1e-6,
-        )
-    else:
-        bot_lower = positives[0]
-        threshold = 0.5
 
-    threshold = min(max(threshold, 1e-6), 1.0 - 1e-6)
+    threshold = min(max(best["threshold"], 1e-6), 1.0 - 1e-6)
     return {
-        "kind": "threshold_centering_v1",
+        "kind": "validator_reward_threshold_v2",
         "threshold": float(threshold),
+        "threshold_source": threshold_source,
         "human_upper": float(human_upper),
         "bot_lower": float(bot_lower),
+        "threshold_gap_fraction": float(threshold_gap_fraction),
+        "target_fpr": float(target_fpr),
+        "calibration_fpr": float(best["fpr"]),
+        "calibration_bot_recall": float(best["bot_recall"]),
+        "calibration_ap_score": float(best["ap_score"]),
+        "calibration_reward": float(best["reward"]),
     }
 
 
@@ -193,6 +344,50 @@ def _apply_score_remap(probabilities: list[float], remap: dict[str, Any] | None)
             mapped = 0.5 + 0.5 * (score - threshold) / (1.0 - threshold)
         adjusted.append(round(_clamp01(mapped), 6))
     return adjusted
+
+
+def _derive_score_expansion(
+    probabilities: list[float],
+    *,
+    lower_quantile: float = 0.01,
+    upper_quantile: float = 0.99,
+) -> dict[str, float]:
+    if not probabilities:
+        return {}
+    values = np.asarray([_clamp01(value) for value in probabilities], dtype=float)
+    low = float(np.quantile(values, min(max(lower_quantile, 0.0), 0.49)))
+    high = float(np.quantile(values, min(max(upper_quantile, 0.51), 1.0)))
+    if high <= low + 1e-9:
+        low = float(values.min())
+        high = float(values.max())
+    if high <= low + 1e-9:
+        return {}
+    return {
+        "kind": "quantile_minmax_v1",
+        "low": low,
+        "high": high,
+        "lower_quantile": float(lower_quantile),
+        "upper_quantile": float(upper_quantile),
+    }
+
+
+def _apply_score_expansion(
+    probabilities: list[float],
+    expansion: dict[str, Any] | None,
+) -> list[float]:
+    if not probabilities or not expansion:
+        return [_clamp01(value) for value in probabilities]
+    try:
+        low = float(expansion.get("low", 0.0))
+        high = float(expansion.get("high", 1.0))
+    except (TypeError, ValueError):
+        return [_clamp01(value) for value in probabilities]
+    if high <= low + 1e-9:
+        return [_clamp01(value) for value in probabilities]
+    return [
+        _clamp01((float(value) - low) / (high - low))
+        for value in probabilities
+    ]
 
 
 def _fit_probability_calibrator(
@@ -564,7 +759,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     extra_trees = ExtraTreesClassifier(
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
-        min_samples_leaf=2,
+        min_samples_leaf=max(1, int(args.extra_trees_min_samples_leaf)),
         class_weight="balanced_subsample",
         random_state=args.seed,
         n_jobs=1,
@@ -573,7 +768,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         learning_rate=args.learning_rate,
         max_depth=args.max_depth,
         max_iter=args.n_estimators,
-        min_samples_leaf=5,
+        min_samples_leaf=max(1, int(args.hist_min_samples_leaf)),
         random_state=args.seed,
     )
 
@@ -581,8 +776,18 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     hist_gradient.fit(X_train, y_train, sample_weight=sample_weight)
     models: list[object] = [extra_trees, hist_gradient]
 
-    raw_probabilities = _average_probabilities(models, X_test)
-    calibration_raw_probabilities = _average_probabilities(models, X_calibration)
+    raw_probabilities = _combine_probabilities(
+        models,
+        X_test,
+        combiner=args.ensemble_combiner,
+        max_blend=args.ensemble_max_blend,
+    )
+    calibration_raw_probabilities = _combine_probabilities(
+        models,
+        X_calibration,
+        combiner=args.ensemble_combiner,
+        max_blend=args.ensemble_max_blend,
+    )
 
     calibration_methods = (
         ["none", "sigmoid", "isotonic"]
@@ -596,42 +801,59 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
             calibration_raw_probabilities,
             method=method,
         )
-        score_remap = (
-            {}
-            if probability_calibrator is not None
-            else _derive_score_remap(y_calibration, calibration_raw_probabilities)
-        )
 
         if probability_calibrator is not None:
-            calibration_probabilities = _apply_probability_calibrator(
+            calibration_base_probabilities = _apply_probability_calibrator(
                 calibration_raw_probabilities, probability_calibrator
             )
-            probabilities = _apply_probability_calibrator(
+            base_probabilities = _apply_probability_calibrator(
                 raw_probabilities, probability_calibrator
             )
             selected_method = method
         else:
-            calibration_probabilities = _apply_score_remap(
-                calibration_raw_probabilities, score_remap
-            )
-            probabilities = _apply_score_remap(raw_probabilities, score_remap)
+            calibration_base_probabilities = [
+                _clamp01(value) for value in calibration_raw_probabilities
+            ]
+            base_probabilities = [_clamp01(value) for value in raw_probabilities]
             selected_method = "none"
+
+        score_expansion = _derive_score_expansion(calibration_base_probabilities)
+        calibration_expanded_probabilities = _apply_score_expansion(
+            calibration_base_probabilities,
+            score_expansion,
+        )
+        expanded_probabilities = _apply_score_expansion(
+            base_probabilities,
+            score_expansion,
+        )
+
+        score_remap = _derive_score_remap(
+            y_calibration,
+            calibration_expanded_probabilities,
+            target_fpr=args.target_fpr,
+            threshold_gap_fraction=args.threshold_gap_fraction,
+        )
+        calibration_probabilities = _apply_score_remap(
+            calibration_expanded_probabilities, score_remap
+        )
+        probabilities = _apply_score_remap(expanded_probabilities, score_remap)
 
         calibration_metrics = _enrich_probability_metrics(
             y_calibration,
             calibration_probabilities,
-            raw_probabilities=calibration_raw_probabilities,
+            raw_probabilities=calibration_expanded_probabilities,
         )
         metrics = _enrich_probability_metrics(
             y_test,
             probabilities,
-            raw_probabilities=raw_probabilities,
+            raw_probabilities=expanded_probabilities,
         )
         candidate_results.append(
             {
                 "method": selected_method,
                 "requested_method": method,
                 "probability_calibrator": probability_calibrator,
+                "score_expansion": score_expansion,
                 "score_remap": score_remap,
                 "probabilities": probabilities,
                 "metrics": metrics,
@@ -647,6 +869,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         ),
     )
     probability_calibrator = best_candidate["probability_calibrator"]
+    score_expansion = best_candidate["score_expansion"]
     score_remap = best_candidate["score_remap"]
     probabilities = best_candidate["probabilities"]
     metrics = dict(best_candidate["metrics"])
@@ -658,6 +881,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "task_type": "supervised-benchmark",
         **_repo_metadata(),
         "feature_schema_hash": _feature_schema_hash(feature_names),
+        "score_expansion": score_expansion,
         "score_remap": score_remap,
         "probability_calibration": selected_calibration,
         "probability_calibration_requested": args.probability_calibration,
@@ -675,7 +899,11 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "n_estimators": float(args.n_estimators),
         "max_depth": float(args.max_depth),
         "learning_rate": float(args.learning_rate),
+        "ensemble_combiner": str(args.ensemble_combiner),
+        "ensemble_max_blend": float(args.ensemble_max_blend),
         "calibration_size": float(args.calibration_size),
+        "target_fpr": float(args.target_fpr),
+        "threshold_gap_fraction": float(args.threshold_gap_fraction),
         "probability_calibration_enabled": float(1.0 if probability_calibrator is not None else 0.0),
         "calibration_selection_reward": float(
             calibration_selection_metrics.get("validator_reward", 0.0)
@@ -690,6 +918,8 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "min_chunk_size": float(args.min_chunk_size),
         "stride": float(args.stride),
         "repeats": float(args.repeats),
+        "extra_trees_min_samples_leaf": float(args.extra_trees_min_samples_leaf),
+        "hist_min_samples_leaf": float(args.hist_min_samples_leaf),
     }
 
     output_path = Path(args.output)
