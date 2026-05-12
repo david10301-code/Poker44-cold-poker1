@@ -110,16 +110,71 @@ class Miner(BaseMinerNeuron):
             if self.predictor is not None
             else runtime_repo_url
         ) or runtime_repo_url
+        model_metadata = dict(self.predictor.metadata) if self.predictor is not None else {}
+        aux_human_rows = int(float(model_metadata.get("aux_human_rows", 0.0) or 0.0))
+        aux_human_calibration_rows = int(
+            float(model_metadata.get("aux_human_calibration_rows", 0.0) or 0.0)
+        )
+        benchmark_rows = int(float(model_metadata.get("benchmark_rows", 0.0) or 0.0))
+        ensemble_combiner = str(model_metadata.get("ensemble_combiner", "") or "").strip()
+        ensemble_max_blend = model_metadata.get("ensemble_max_blend")
+        score_expansion = model_metadata.get("score_expansion") or {}
+        score_remap = model_metadata.get("score_remap") or {}
+        trained_with_aux_humans = aux_human_rows > 0 or aux_human_calibration_rows > 0
+        supervised_notes = (
+            "Supervised benchmark model trained on released evaluation chunks"
+        )
+        if trained_with_aux_humans:
+            supervised_notes += (
+                " plus a human-only baseline corpus for human-safety calibration"
+            )
+        if ensemble_combiner:
+            supervised_notes += f"; ensemble_combiner={ensemble_combiner}"
+            if ensemble_max_blend is not None:
+                supervised_notes += f", ensemble_max_blend={ensemble_max_blend}"
+        if score_expansion:
+            supervised_notes += f"; score_expansion={score_expansion.get('kind', 'enabled')}"
+        if score_remap:
+            supervised_notes += (
+                f"; score_remap={score_remap.get('kind', 'enabled')} "
+                f"threshold={score_remap.get('threshold', 'unknown')}"
+            )
+        training_data_statement = (
+            f"Trained on {benchmark_rows or 'released'} benchmark chunks with groundTruth labels."
+            if self.predictor is not None
+            else "Reference heuristic miner. No training step. Uses only runtime chunk features."
+        )
+        if self.predictor is not None and trained_with_aux_humans:
+            training_data_statement += (
+                f" Added {aux_human_rows} auxiliary human-only training chunks"
+                f" and {aux_human_calibration_rows} auxiliary human-only calibration chunks"
+                " from hands_generator/human_hands/poker_hands_combined.json.gz."
+            )
+        training_data_sources = (
+            ["released_training_benchmark", "human_only_baseline_corpus"]
+            if self.predictor is not None and trained_with_aux_humans
+            else (["released_training_benchmark"] if self.predictor is not None else ["none"])
+        )
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
-            implementation_files=[Path(__file__).resolve()],
+            implementation_files=[
+                Path(__file__).resolve(),
+                repo_root / "poker44_ml" / "inference.py",
+                repo_root / "poker44_ml" / "features.py",
+            ],
             defaults={
                 "model_name": (
-                    "poker44_benchmark_supervised"
+                    "poker44_benchmark_supervised_human_baseline"
+                    if trained_with_aux_humans
+                    else "poker44_benchmark_supervised"
                     if self.predictor is not None
                     else "poker44-reference-heuristic"
                 ),
-                "model_version": "1" if self.predictor is not None else "2",
+                "model_version": (
+                    "human-baseline-v6"
+                    if trained_with_aux_humans
+                    else ("1" if self.predictor is not None else "2")
+                ),
                 "framework": (
                     self.predictor.metadata.get("framework", "benchmark-supervised")
                     if self.predictor is not None
@@ -128,25 +183,18 @@ class Miner(BaseMinerNeuron):
                 "repo_commit": published_repo_commit,
                 "repo_url": published_repo_url,
                 "notes": (
-                    "Supervised benchmark model trained on released evaluation chunks."
+                    supervised_notes
                     if self.predictor is not None
                     else "Challenge-aligned heuristic miner that scores chunk-level "
                     "behavioral regularity and action patterns."
                 ),
                 "open_source": True,
                 "inference_mode": "remote",
-                "training_data_statement": (
-                    "Trained on released benchmark chunks with groundTruth labels."
-                    if self.predictor is not None
-                    else "Reference heuristic miner. No training step. Uses only runtime chunk features."
-                ),
-                "training_data_sources": (
-                    ["released_training_benchmark"]
-                    if self.predictor is not None
-                    else ["none"]
-                ),
+                "training_data_statement": training_data_statement,
+                "training_data_sources": training_data_sources,
                 "private_data_attestation": (
-                    "This reference miner did not train on validator-only evaluation data, but trained on benchmark training data."
+                    "No validator-private data used. Supervised artifacts use released benchmark labels"
+                    " and, when present, local human-only baseline hands."
                 ),
             },
         )

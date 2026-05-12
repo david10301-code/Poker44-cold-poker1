@@ -21,6 +21,7 @@ MIN_REQUIRED_MANIFEST_FIELDS = [
 REFERENCE_MINER_MODEL_NAMES = {
     "poker44-reference-heuristic",
     "poker44_benchmark_supervised",
+    "poker44_benchmark_supervised_human_baseline",
 }
 REFERENCE_REPO_URL = "https://github.com/Poker44/Poker44-subnet"
 GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
