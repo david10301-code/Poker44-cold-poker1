@@ -81,6 +81,7 @@ def parse_args() -> argparse.Namespace:
         default="average",
     )
     parser.add_argument("--ensemble-max-blend", type=float, default=0.75)
+    parser.add_argument("--feature-distance-blend", type=float, default=0.0)
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--calibration-size", type=float, default=0.15)
     parser.add_argument(
@@ -389,6 +390,111 @@ def _apply_score_expansion(
     return [
         _clamp01((float(value) - low) / (high - low))
         for value in probabilities
+    ]
+
+
+def _build_feature_distance_calibrator(
+    rows: list[list[float]],
+    labels: list[int],
+    *,
+    blend: float,
+) -> dict[str, Any]:
+    blend = min(max(float(blend), 0.0), 1.0)
+    if blend <= 0.0 or not rows or len({int(label) for label in labels}) < 2:
+        return {}
+    matrix = np.asarray(rows, dtype=float)
+    label_array = np.asarray(labels, dtype=int)
+    means = matrix.mean(axis=0)
+    scales = matrix.std(axis=0)
+    scales = np.where(scales < 1e-6, 1.0, scales)
+    standardized = (matrix - means) / scales
+    human_rows = standardized[label_array == 0]
+    bot_rows = standardized[label_array == 1]
+    if human_rows.size == 0 or bot_rows.size == 0:
+        return {}
+    human_centroid = human_rows.mean(axis=0)
+    bot_centroid = bot_rows.mean(axis=0)
+    separation = np.abs(bot_centroid - human_centroid)
+    weights = separation / max(float(separation.mean()), 1e-6)
+    weights = np.clip(weights, 0.25, 4.0)
+    logits = _feature_distance_logits(
+        standardized,
+        human_centroid,
+        bot_centroid,
+        weights,
+        temperature=1.0,
+    )
+    abs_logits = np.abs(np.asarray(logits, dtype=float))
+    nonzero = abs_logits[abs_logits > 1e-9]
+    temperature = float(np.median(nonzero)) if nonzero.size else 1.0
+    return {
+        "kind": "class_centroid_distance_v1",
+        "blend": blend,
+        "means": [float(value) for value in means],
+        "scales": [float(value) for value in scales],
+        "human_centroid": [float(value) for value in human_centroid],
+        "bot_centroid": [float(value) for value in bot_centroid],
+        "weights": [float(value) for value in weights],
+        "temperature": max(float(temperature), 1e-6),
+    }
+
+
+def _feature_distance_logits(
+    standardized: np.ndarray,
+    human_centroid: np.ndarray,
+    bot_centroid: np.ndarray,
+    weights: np.ndarray,
+    *,
+    temperature: float,
+) -> list[float]:
+    human_delta = standardized - human_centroid
+    bot_delta = standardized - bot_centroid
+    human_distance = np.sqrt(np.mean(weights * human_delta * human_delta, axis=1))
+    bot_distance = np.sqrt(np.mean(weights * bot_delta * bot_delta, axis=1))
+    return [
+        float((human - bot) / max(float(temperature), 1e-6))
+        for human, bot in zip(human_distance, bot_distance)
+    ]
+
+
+def _apply_feature_distance_calibrator(
+    probabilities: list[float],
+    rows: list[list[float]],
+    calibrator: dict[str, Any] | None,
+) -> list[float]:
+    if not probabilities or not rows or not calibrator:
+        return [_clamp01(value) for value in probabilities]
+    try:
+        blend = min(max(float(calibrator.get("blend", 0.0)), 0.0), 1.0)
+        means = np.asarray(calibrator["means"], dtype=float)
+        scales = np.asarray(calibrator["scales"], dtype=float)
+        human_centroid = np.asarray(calibrator["human_centroid"], dtype=float)
+        bot_centroid = np.asarray(calibrator["bot_centroid"], dtype=float)
+        weights = np.asarray(calibrator["weights"], dtype=float)
+        temperature = float(calibrator.get("temperature", 1.0))
+    except (KeyError, TypeError, ValueError):
+        return [_clamp01(value) for value in probabilities]
+    if blend <= 0.0:
+        return [_clamp01(value) for value in probabilities]
+    matrix = np.asarray(rows, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[1] != means.shape[0]:
+        return [_clamp01(value) for value in probabilities]
+    scales = np.where(np.abs(scales) < 1e-6, 1.0, scales)
+    standardized = (matrix - means) / scales
+    logits = _feature_distance_logits(
+        standardized,
+        human_centroid,
+        bot_centroid,
+        weights,
+        temperature=temperature,
+    )
+    distance_scores = [
+        _clamp01(1.0 / (1.0 + np.exp(-max(min(logit, 20.0), -20.0))))
+        for logit in logits
+    ]
+    return [
+        _clamp01((1.0 - blend) * float(probability) + blend * distance_score)
+        for probability, distance_score in zip(probabilities, distance_scores)
     ]
 
 
@@ -805,6 +911,11 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     extra_trees.fit(X_train, y_train, sample_weight=sample_weight)
     hist_gradient.fit(X_train, y_train, sample_weight=sample_weight)
     models: list[object] = [extra_trees, hist_gradient]
+    feature_distance_calibrator = _build_feature_distance_calibrator(
+        X_train,
+        y_train,
+        blend=args.feature_distance_blend,
+    )
 
     raw_probabilities = _combine_probabilities(
         models,
@@ -847,6 +958,17 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
             base_probabilities = [_clamp01(value) for value in raw_probabilities]
             selected_method = "none"
 
+        calibration_base_probabilities = _apply_feature_distance_calibrator(
+            calibration_base_probabilities,
+            X_calibration,
+            feature_distance_calibrator,
+        )
+        base_probabilities = _apply_feature_distance_calibrator(
+            base_probabilities,
+            X_test,
+            feature_distance_calibrator,
+        )
+
         score_expansion = _derive_score_expansion(calibration_base_probabilities)
         calibration_expanded_probabilities = _apply_score_expansion(
             calibration_base_probabilities,
@@ -883,6 +1005,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
                 "method": selected_method,
                 "requested_method": method,
                 "probability_calibrator": probability_calibrator,
+                "feature_distance_calibrator": feature_distance_calibrator,
                 "score_expansion": score_expansion,
                 "score_remap": score_remap,
                 "probabilities": probabilities,
@@ -899,6 +1022,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         ),
     )
     probability_calibrator = best_candidate["probability_calibrator"]
+    feature_distance_calibrator = best_candidate["feature_distance_calibrator"]
     score_expansion = best_candidate["score_expansion"]
     score_remap = best_candidate["score_remap"]
     probabilities = best_candidate["probabilities"]
@@ -912,6 +1036,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         **_repo_metadata(),
         "feature_schema_hash": _feature_schema_hash(feature_names),
         "score_expansion": score_expansion,
+        "feature_distance_calibrator": feature_distance_calibrator,
         "score_remap": score_remap,
         "probability_calibration": selected_calibration,
         "probability_calibration_requested": args.probability_calibration,
@@ -934,6 +1059,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "learning_rate": float(args.learning_rate),
         "ensemble_combiner": str(args.ensemble_combiner),
         "ensemble_max_blend": float(args.ensemble_max_blend),
+        "feature_distance_blend": float(args.feature_distance_blend),
         "calibration_size": float(args.calibration_size),
         "target_fpr": float(args.target_fpr),
         "threshold_gap_fraction": float(args.threshold_gap_fraction),

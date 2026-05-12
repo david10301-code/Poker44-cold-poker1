@@ -41,6 +41,9 @@ class Poker44Model:
         self.score_quantiles = dict(self.metadata.get("score_quantiles") or {})
         self.score_expansion = dict(self.metadata.get("score_expansion") or {})
         self.score_remap = dict(self.metadata.get("score_remap") or {})
+        self.feature_distance_calibrator = dict(
+            self.metadata.get("feature_distance_calibrator") or {}
+        )
         self.ensemble_combiner = str(self.metadata.get("ensemble_combiner", "average"))
         self.ensemble_max_blend = float(self.metadata.get("ensemble_max_blend", 0.75))
         self.probability_calibrator = artifact.get("probability_calibrator")
@@ -154,10 +157,14 @@ class Poker44Model:
             self.probability_calibrator, "transform"
         ):
             calibrated = self.probability_calibrator.transform(combined)
+            calibrated = self._apply_feature_distance_calibrator(
+                [self._clamp01(value) for value in calibrated],
+                rows,
+            )
             return [
                 round(value, 6)
                 for value in self._apply_supervised_score_remap(
-                    [self._clamp01(value) for value in calibrated]
+                    calibrated
                 )
             ]
         if self.probability_calibrator is not None and hasattr(
@@ -166,13 +173,65 @@ class Poker44Model:
             calibrated = self.probability_calibrator.predict_proba(
                 [[float(value)] for value in combined]
             )
+            calibrated_scores = self._apply_feature_distance_calibrator(
+                [self._clamp01(row[1]) for row in calibrated],
+                rows,
+            )
             return [
                 round(value, 6)
                 for value in self._apply_supervised_score_remap(
-                    [self._clamp01(row[1]) for row in calibrated]
+                    calibrated_scores
                 )
             ]
+        combined = self._apply_feature_distance_calibrator(combined, rows)
         return [round(value, 6) for value in self._apply_supervised_score_remap(combined)]
+
+    def _apply_feature_distance_calibrator(
+        self,
+        probabilities: list[float],
+        rows: list[list[float]],
+    ) -> list[float]:
+        calibrator = self.feature_distance_calibrator
+        if not probabilities or not rows or not calibrator:
+            return [self._clamp01(value) for value in probabilities]
+        try:
+            blend = min(max(float(calibrator.get("blend", 0.0)), 0.0), 1.0)
+            means = [float(value) for value in calibrator["means"]]
+            scales = [float(value) for value in calibrator["scales"]]
+            human_centroid = [float(value) for value in calibrator["human_centroid"]]
+            bot_centroid = [float(value) for value in calibrator["bot_centroid"]]
+            weights = [float(value) for value in calibrator["weights"]]
+            temperature = max(float(calibrator.get("temperature", 1.0)), 1e-6)
+        except (KeyError, TypeError, ValueError):
+            return [self._clamp01(value) for value in probabilities]
+        if blend <= 0.0 or not means or len(rows[0]) != len(means):
+            return [self._clamp01(value) for value in probabilities]
+        distance_scores: list[float] = []
+        for row in rows:
+            standardized = [
+                (float(value) - mean) / (scale if abs(scale) >= 1e-6 else 1.0)
+                for value, mean, scale in zip(row, means, scales)
+            ]
+            human_distance = math.sqrt(
+                sum(
+                    weight * (value - center) * (value - center)
+                    for value, center, weight in zip(standardized, human_centroid, weights)
+                )
+                / max(len(standardized), 1)
+            )
+            bot_distance = math.sqrt(
+                sum(
+                    weight * (value - center) * (value - center)
+                    for value, center, weight in zip(standardized, bot_centroid, weights)
+                )
+                / max(len(standardized), 1)
+            )
+            logit = max(min((human_distance - bot_distance) / temperature, 20.0), -20.0)
+            distance_scores.append(self._clamp01(1.0 / (1.0 + math.exp(-logit))))
+        return [
+            self._clamp01((1.0 - blend) * float(probability) + blend * distance_score)
+            for probability, distance_score in zip(probabilities, distance_scores)
+        ]
 
     def _apply_supervised_score_remap(self, probabilities: list[float]) -> list[float]:
         expanded = self._apply_supervised_score_expansion(probabilities)
