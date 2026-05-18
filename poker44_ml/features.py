@@ -76,6 +76,61 @@ def _normalized_entropy(values: list[float]) -> float:
     return safe_div(entropy, math.log(len(probs)))
 
 
+def _categorical_entropy(values: list[Any]) -> float:
+    if not values:
+        return 0.0
+    counts: dict[Any, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return _normalized_entropy([float(count) for count in counts.values()])
+
+
+def _unique_share(values: list[Any]) -> float:
+    return safe_div(len(set(values)), len(values)) if values else 0.0
+
+
+def _top_share(values: list[Any]) -> float:
+    if not values:
+        return 0.0
+    counts: dict[Any, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return safe_div(max(counts.values()), len(values))
+
+
+def _max_run_share(values: list[Any]) -> float:
+    if not values:
+        return 0.0
+    longest = 1
+    current = 1
+    for prev, value in zip(values, values[1:]):
+        if value == prev:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 1
+    return safe_div(longest, len(values))
+
+
+def _quantile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = min(max(float(fraction), 0.0), 1.0) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _iqr(values: list[float]) -> float:
+    return _quantile(values, 0.75) - _quantile(values, 0.25)
+
+
 def _hand_feature_values(hand: dict[str, Any]) -> tuple[float, ...]:
     actions = hand.get("actions") or []
     players = hand.get("players") or []
@@ -301,9 +356,93 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     low_amount_style_count = 0
     hero_button_count = 0
     low_actor_diversity_count = 0
+    action_signatures: list[tuple[str, ...]] = []
+    action_bigram_signatures: list[tuple[tuple[str, str], ...]] = []
+    actor_signatures: list[tuple[int, ...]] = []
+    street_signatures: list[tuple[str, ...]] = []
+    amount_signatures: list[tuple[float, ...]] = []
+    action_counts: list[float] = []
+    actor_entropies: list[float] = []
+    action_entropies: list[float] = []
+    amount_entropies: list[float] = []
+    amount_unique_shares: list[float] = []
+    max_actor_run_shares: list[float] = []
+    max_action_run_shares: list[float] = []
+    actor_switch_rates: list[float] = []
+    action_transition_entropies: list[float] = []
+    zero_amount_noncheck_shares: list[float] = []
+    repeated_amount_shares: list[float] = []
+    hero_seats: list[int] = []
+    button_seats: list[int] = []
+    player_counts: list[int] = []
+    uniform_starting_stack_count = 0
 
     for hand in chunk:
         values = _hand_feature_values(hand)
+        actions = hand.get("actions") or []
+        players = hand.get("players") or []
+        metadata = hand.get("metadata") or {}
+        action_types = [
+            str(action.get("action_type") or "").lower()
+            for action in actions
+            if isinstance(action, dict)
+        ]
+        actor_sequence = [
+            int(action.get("actor_seat") or 0)
+            for action in actions
+            if isinstance(action, dict) and int(action.get("actor_seat") or 0)
+        ]
+        street_sequence = [
+            str(action.get("street") or "").lower()
+            for action in actions
+            if isinstance(action, dict)
+        ]
+        amount_sequence = [
+            round(safe_float(action.get("normalized_amount_bb"), 0.0), 3)
+            for action in actions
+            if isinstance(action, dict)
+        ]
+        bigrams = tuple(zip(action_types, action_types[1:]))
+        action_signatures.append(tuple(action_types))
+        action_bigram_signatures.append(bigrams)
+        actor_signatures.append(tuple(actor_sequence))
+        street_signatures.append(tuple(street_sequence))
+        amount_signatures.append(tuple(amount_sequence))
+        action_counts.append(float(len(actions)))
+        actor_entropies.append(_categorical_entropy(actor_sequence))
+        action_entropies.append(_categorical_entropy(action_types))
+        amount_entropies.append(_categorical_entropy(amount_sequence))
+        amount_unique_shares.append(_unique_share(amount_sequence))
+        max_actor_run_shares.append(_max_run_share(actor_sequence))
+        max_action_run_shares.append(_max_run_share(action_types))
+        actor_switch_rates.append(
+            safe_div(
+                sum(1 for prev, curr in zip(actor_sequence, actor_sequence[1:]) if prev != curr),
+                max(len(actor_sequence) - 1, 1),
+            )
+        )
+        action_transition_entropies.append(_categorical_entropy(list(bigrams)))
+        zero_amount_noncheck_shares.append(
+            safe_div(
+                sum(
+                    1
+                    for action_type, amount in zip(action_types, amount_sequence)
+                    if amount <= 0.0 and action_type not in {"check", "fold"}
+                ),
+                max(len(action_types), 1),
+            )
+        )
+        repeated_amount_shares.append(max(0.0, 1.0 - _unique_share(amount_sequence)))
+        hero_seats.append(int(metadata.get("hero_seat") or 0))
+        button_seats.append(int(metadata.get("button_seat") or 0))
+        player_counts.append(len(players))
+        starting_stacks = [
+            round(safe_float(player.get("starting_stack"), 0.0), 6)
+            for player in players
+            if isinstance(player, dict)
+        ]
+        uniform_starting_stack_count += int(bool(starting_stacks) and len(set(starting_stacks)) == 1)
+
         street_depth = values[9]
         showdown_flag = values[10]
         aggressive_share = values[14]
@@ -358,4 +497,34 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     output["low_amount_style_rate"] = low_amount_style_count / hand_total
     output["hero_button_rate"] = hero_button_count / hand_total
     output["low_actor_diversity_rate"] = low_actor_diversity_count / hand_total
+    output["top_action_signature_share"] = _top_share(action_signatures)
+    output["unique_action_signature_share"] = _unique_share(action_signatures)
+    output["top_action_bigram_signature_share"] = _top_share(action_bigram_signatures)
+    output["unique_action_bigram_signature_share"] = _unique_share(action_bigram_signatures)
+    output["top_actor_signature_share"] = _top_share(actor_signatures)
+    output["unique_actor_signature_share"] = _unique_share(actor_signatures)
+    output["top_street_signature_share"] = _top_share(street_signatures)
+    output["unique_street_signature_share"] = _unique_share(street_signatures)
+    output["top_amount_signature_share"] = _top_share(amount_signatures)
+    output["unique_amount_signature_share"] = _unique_share(amount_signatures)
+    output["action_count_iqr"] = _iqr(action_counts)
+    output["action_count_unique_share"] = _unique_share(action_counts)
+    output["actor_entropy_mean"] = safe_div(sum(actor_entropies), hand_total)
+    output["actor_entropy_iqr"] = _iqr(actor_entropies)
+    output["action_entropy_chunk_mean"] = safe_div(sum(action_entropies), hand_total)
+    output["amount_entropy_mean"] = safe_div(sum(amount_entropies), hand_total)
+    output["amount_unique_share_mean"] = safe_div(sum(amount_unique_shares), hand_total)
+    output["amount_unique_share_iqr"] = _iqr(amount_unique_shares)
+    output["max_actor_run_share_mean"] = safe_div(sum(max_actor_run_shares), hand_total)
+    output["max_actor_run_share_max"] = max(max_actor_run_shares) if max_actor_run_shares else 0.0
+    output["max_action_run_share_mean"] = safe_div(sum(max_action_run_shares), hand_total)
+    output["max_action_run_share_max"] = max(max_action_run_shares) if max_action_run_shares else 0.0
+    output["actor_switch_rate_mean"] = safe_div(sum(actor_switch_rates), hand_total)
+    output["action_transition_entropy_mean"] = safe_div(sum(action_transition_entropies), hand_total)
+    output["zero_amount_noncheck_share_mean"] = safe_div(sum(zero_amount_noncheck_shares), hand_total)
+    output["repeated_amount_share_mean"] = safe_div(sum(repeated_amount_shares), hand_total)
+    output["hero_seat_entropy"] = _categorical_entropy(hero_seats)
+    output["button_seat_entropy"] = _categorical_entropy(button_seats)
+    output["player_count_unique_share"] = _unique_share(player_counts)
+    output["uniform_starting_stack_rate"] = uniform_starting_stack_count / hand_total
     return output

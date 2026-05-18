@@ -75,6 +75,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-chunk-size", type=int, default=20)
     parser.add_argument("--human-guard-strength", type=float, default=0.18)
     parser.add_argument("--human-guard-quantile", type=float, default=0.995)
+    parser.add_argument(
+        "--score-logit-bias",
+        type=float,
+        default=0.0,
+        help="Add this value to calibrated score logits before human guard. Negative lowers scores.",
+    )
+    parser.add_argument(
+        "--score-logit-temperature",
+        type=float,
+        default=1.0,
+        help="Divide score logits by this positive value after adding score-logit-bias.",
+    )
     return parser.parse_args()
 
 
@@ -226,6 +238,20 @@ def _apply_human_guard(scores: list[float], guard: dict[str, float]) -> list[flo
         value = max(0.0, min(1.0, float(score)))
         human_like = 1.0 / (1.0 + np.exp((value - anchor) / softness))
         output.append(max(0.0, min(1.0, value * (1.0 - strength * human_like))))
+    return output
+
+
+def _apply_score_logit(scores: list[float], *, bias: float, temperature: float) -> list[float]:
+    if not scores:
+        return []
+    temperature = max(float(temperature), 1e-6)
+    if abs(float(bias)) < 1e-12 and abs(temperature - 1.0) < 1e-12:
+        return [max(0.0, min(1.0, float(score))) for score in scores]
+    output: list[float] = []
+    for score in scores:
+        value = max(1e-6, min(1.0 - 1e-6, float(score)))
+        logit = np.log(value / (1.0 - value))
+        output.append(float(1.0 / (1.0 + np.exp(-((logit + float(bias)) / temperature)))))
     return output
 
 
@@ -427,7 +453,12 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
 
     raw_test = _model_scores(models, model_weights, X_test)
     calibrated_test = _apply_calibrator(calibrator, raw_test)
-    final_test = _apply_human_guard(calibrated_test, human_guard)
+    logit_test = _apply_score_logit(
+        calibrated_test,
+        bias=args.score_logit_bias,
+        temperature=args.score_logit_temperature,
+    )
+    final_test = _apply_human_guard(logit_test, human_guard)
     metrics = _enrich_probability_metrics(y_test, final_test, raw_probabilities=raw_test)
 
     metadata: dict[str, Any] = {
@@ -448,6 +479,8 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "aux_human_weight": float(args.aux_human_weight),
         "human_path": str(human_path or ""),
         "human_guard": human_guard,
+        "score_logit_bias": float(args.score_logit_bias),
+        "score_logit_temperature": float(args.score_logit_temperature),
         "model_weights": model_weights,
         "n_estimators": float(args.n_estimators),
         "max_depth": float(args.max_depth),

@@ -34,6 +34,11 @@ class Poker44Model:
         self.metadata = dict(artifact.get("metadata") or {})
         self.calibrator = artifact.get("calibrator")
         self.human_guard = dict(self.metadata.get("human_guard") or {})
+        self.score_logit_bias = float(self.metadata.get("score_logit_bias", 0.0) or 0.0)
+        self.score_logit_temperature = max(
+            float(self.metadata.get("score_logit_temperature", 1.0) or 1.0),
+            1e-6,
+        )
         self.model_weights = list(
             artifact.get("model_weights")
             or self.metadata.get("model_weights")
@@ -114,13 +119,27 @@ class Poker44Model:
             guarded.append(self._clamp01(score * (1.0 - strength * human_like)))
         return guarded
 
+    def _apply_score_logit(self, scores: list[float]) -> list[float]:
+        if not scores:
+            return []
+        if abs(self.score_logit_bias) < 1e-12 and abs(self.score_logit_temperature - 1.0) < 1e-12:
+            return [self._clamp01(value) for value in scores]
+        output: list[float] = []
+        for score in scores:
+            value = max(1e-6, min(1.0 - 1e-6, float(score)))
+            logit = math.log(value / (1.0 - value))
+            adjusted = (logit + self.score_logit_bias) / self.score_logit_temperature
+            output.append(self._clamp01(1.0 / (1.0 + math.exp(-adjusted))))
+        return output
+
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:
             return []
         rows = self._aligned_rows(chunks)
         raw_scores = self._raw_model_scores(rows)
         calibrated_scores = self._apply_calibrator(raw_scores)
-        guarded_scores = self._apply_human_guard(calibrated_scores)
+        logit_scores = self._apply_score_logit(calibrated_scores)
+        guarded_scores = self._apply_human_guard(logit_scores)
         return [round(self._clamp01(value), 6) for value in guarded_scores]
 
     def predict_chunk_score(self, chunk: list[dict[str, Any]]) -> float:
@@ -136,10 +155,12 @@ class Poker44Model:
         rows = self._aligned_rows(chunks)
         raw_scores = self._raw_model_scores(rows)
         calibrated_scores = self._apply_calibrator(raw_scores)
-        final_scores = self._apply_human_guard(calibrated_scores)
+        logit_scores = self._apply_score_logit(calibrated_scores)
+        final_scores = self._apply_human_guard(logit_scores)
         return {
             "raw_scores": [round(value, 6) for value in raw_scores],
             "calibrated_scores": [round(value, 6) for value in calibrated_scores],
+            "logit_scores": [round(value, 6) for value in logit_scores],
             "final_scores": [round(value, 6) for value in final_scores],
         }
 
