@@ -12,11 +12,8 @@ import numpy as np
 from poker44.score.scoring import reward
 from poker44_ml.inference import Poker44Model
 from training.build_dataset import (
-    build_human_chunk_examples,
     load_benchmark_examples,
-    load_human_hands,
     resolve_benchmark_paths,
-    resolve_human_path,
 )
 
 try:
@@ -54,7 +51,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a clean Poker44 benchmark model.")
     parser.add_argument("--benchmark-path", type=str, default=None)
-    parser.add_argument("--human-path", type=str, default=None)
     parser.add_argument("--output", type=str, default=str(REPO_ROOT / "models" / "poker44_clean_restart.joblib"))
     parser.add_argument("--holdout-latest-days", type=int, default=2)
     parser.add_argument("--holdout-source-dates", type=str, default=None)
@@ -63,18 +59,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-estimators", type=int, default=700)
     parser.add_argument("--max-depth", type=int, default=9)
+    parser.add_argument("--extra-trees-estimators", type=int, default=None)
+    parser.add_argument("--random-forest-estimators", type=int, default=None)
+    parser.add_argument("--hist-gradient-estimators", type=int, default=None)
+    parser.add_argument("--extra-trees-max-depth", type=int, default=None)
+    parser.add_argument("--random-forest-max-depth", type=int, default=None)
+    parser.add_argument("--hist-gradient-max-depth", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=0.04)
     parser.add_argument("--extra-trees-weight", type=float, default=0.45)
     parser.add_argument("--random-forest-weight", type=float, default=0.25)
     parser.add_argument("--hist-gradient-weight", type=float, default=0.30)
-    parser.add_argument("--enable-aux-human", action="store_true")
-    parser.add_argument("--aux-human-weight", type=float, default=3.0)
-    parser.add_argument("--max-aux-human-chunks", type=int, default=5000)
-    parser.add_argument("--aux-human-calibration-fraction", type=float, default=0.25)
-    parser.add_argument("--aux-human-chunk-sizes", type=str, default="38,40,48,56,64,72,80,88")
-    parser.add_argument("--min-chunk-size", type=int, default=20)
-    parser.add_argument("--human-guard-strength", type=float, default=0.18)
-    parser.add_argument("--human-guard-quantile", type=float, default=0.995)
     parser.add_argument(
         "--score-logit-bias",
         type=float,
@@ -212,35 +206,6 @@ def _apply_calibrator(calibrator: object | None, scores: list[float]) -> list[fl
     return [max(0.0, min(1.0, float(row[1]))) for row in probabilities]
 
 
-def _human_guard_from_scores(scores: list[float], *, quantile: float, strength: float) -> dict[str, float]:
-    if not scores or strength <= 0.0:
-        return {}
-    values = np.asarray(scores, dtype=float)
-    anchor = float(np.quantile(values, min(max(float(quantile), 0.50), 0.999)))
-    spread = float(np.std(values))
-    return {
-        "kind": "aux_human_score_guard_v1",
-        "anchor": anchor,
-        "softness": max(spread * 0.5, 0.015),
-        "strength": min(max(float(strength), 0.0), 0.8),
-        "quantile": float(quantile),
-    }
-
-
-def _apply_human_guard(scores: list[float], guard: dict[str, float]) -> list[float]:
-    if not scores or not guard:
-        return [max(0.0, min(1.0, float(score))) for score in scores]
-    anchor = float(guard.get("anchor", 0.0))
-    softness = max(float(guard.get("softness", 1.0)), 1e-6)
-    strength = min(max(float(guard.get("strength", 0.0)), 0.0), 1.0)
-    output: list[float] = []
-    for score in scores:
-        value = max(0.0, min(1.0, float(score)))
-        human_like = 1.0 / (1.0 + np.exp((value - anchor) / softness))
-        output.append(max(0.0, min(1.0, value * (1.0 - strength * human_like))))
-    return output
-
-
 def _apply_score_logit(scores: list[float], *, bias: float, temperature: float) -> list[float]:
     if not scores:
         return []
@@ -368,56 +333,34 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     feature_names = sorted(benchmark_feature_rows[0])
     benchmark_chunk_sizes = sorted({len(example["chunk"]) for example in benchmark_examples})
 
-    aux_train: list[dict[str, Any]] = []
-    aux_calibration: list[dict[str, Any]] = []
-    human_path = None
-    if args.enable_aux_human:
-        human_path = resolve_human_path(args.human_path)
-        human_hands = load_human_hands(human_path)
-        chunk_sizes = [
-            int(item.strip())
-            for item in str(args.aux_human_chunk_sizes).split(",")
-            if item.strip()
-        ] or benchmark_chunk_sizes
-        aux_examples = build_human_chunk_examples(
-            human_hands,
-            chunk_sizes=chunk_sizes,
-            count=max(0, int(args.max_aux_human_chunks)),
-            min_chunk_size=max(1, int(args.min_chunk_size)),
-            seed=args.seed,
-            source_path=str(human_path),
-        )
-        if aux_examples and args.aux_human_calibration_fraction > 0:
-            aux_train, aux_calibration = train_test_split(
-                aux_examples,
-                test_size=min(max(float(args.aux_human_calibration_fraction), 0.05), 0.5),
-                random_state=args.seed,
-                shuffle=True,
-            )
-        else:
-            aux_train = aux_examples
+    X_fit = _build_matrix(fit_examples, feature_names)
+    y_fit = [int(example["label"]) for example in fit_examples]
+    weights = [1.0 for _ in fit_examples]
 
-    X_fit = _build_matrix(fit_examples + aux_train, feature_names)
-    y_fit = [int(example["label"]) for example in fit_examples] + [0 for _ in aux_train]
-    weights = [1.0 for _ in fit_examples] + [float(args.aux_human_weight) for _ in aux_train]
-
-    X_cal = _build_matrix(calibration_examples + aux_calibration, feature_names)
-    y_cal = [int(example["label"]) for example in calibration_examples] + [0 for _ in aux_calibration]
+    X_cal = _build_matrix(calibration_examples, feature_names)
+    y_cal = [int(example["label"]) for example in calibration_examples]
     X_test = _build_matrix(test_examples, feature_names)
     y_test = [int(example["label"]) for example in test_examples]
 
+    extra_trees_estimators = int(args.extra_trees_estimators or args.n_estimators)
+    random_forest_estimators = int(args.random_forest_estimators or args.n_estimators)
+    hist_gradient_estimators = int(args.hist_gradient_estimators or args.n_estimators)
+    extra_trees_max_depth = int(args.extra_trees_max_depth or args.max_depth)
+    random_forest_max_depth = int(args.random_forest_max_depth or args.max_depth)
+    hist_gradient_max_depth = int(args.hist_gradient_max_depth or args.max_depth)
+
     models: list[object] = [
         ExtraTreesClassifier(
-            n_estimators=int(args.n_estimators),
-            max_depth=int(args.max_depth),
+            n_estimators=extra_trees_estimators,
+            max_depth=extra_trees_max_depth,
             min_samples_leaf=1,
             class_weight="balanced_subsample",
             random_state=args.seed,
             n_jobs=1,
         ),
         RandomForestClassifier(
-            n_estimators=max(100, int(args.n_estimators // 2)),
-            max_depth=int(args.max_depth),
+            n_estimators=random_forest_estimators,
+            max_depth=random_forest_max_depth,
             min_samples_leaf=1,
             class_weight="balanced_subsample",
             random_state=args.seed + 7,
@@ -425,8 +368,8 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         ),
         HistGradientBoostingClassifier(
             learning_rate=float(args.learning_rate),
-            max_iter=int(args.n_estimators),
-            max_depth=int(args.max_depth),
+            max_iter=hist_gradient_estimators,
+            max_depth=hist_gradient_max_depth,
             min_samples_leaf=2,
             random_state=args.seed + 13,
         ),
@@ -441,15 +384,6 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     ]
     raw_cal = _model_scores(models, model_weights, X_cal) if X_cal else []
     calibrator = _fit_calibrator(y_cal, raw_cal) if raw_cal and len(set(y_cal)) >= 2 else None
-    calibrated_cal = _apply_calibrator(calibrator, raw_cal)
-
-    aux_cal_count = len(aux_calibration)
-    aux_cal_scores = calibrated_cal[-aux_cal_count:] if aux_cal_count else []
-    human_guard = _human_guard_from_scores(
-        aux_cal_scores,
-        quantile=args.human_guard_quantile,
-        strength=args.human_guard_strength,
-    )
 
     raw_test = _model_scores(models, model_weights, X_test)
     calibrated_test = _apply_calibrator(calibrator, raw_test)
@@ -458,8 +392,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         bias=args.score_logit_bias,
         temperature=args.score_logit_temperature,
     )
-    final_test = _apply_human_guard(logit_test, human_guard)
-    metrics = _enrich_probability_metrics(y_test, final_test, raw_probabilities=raw_test)
+    metrics = _enrich_probability_metrics(y_test, logit_test, raw_probabilities=raw_test)
 
     metadata: dict[str, Any] = {
         "framework": "clean-restart:ExtraTrees+RandomForest+HistGradientBoosting",
@@ -474,16 +407,17 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "train_rows": float(len(X_fit)),
         "calibration_rows": float(len(X_cal)),
         "test_rows": float(len(X_test)),
-        "aux_human_rows": float(len(aux_train)),
-        "aux_human_calibration_rows": float(len(aux_calibration)),
-        "aux_human_weight": float(args.aux_human_weight),
-        "human_path": str(human_path or ""),
-        "human_guard": human_guard,
         "score_logit_bias": float(args.score_logit_bias),
         "score_logit_temperature": float(args.score_logit_temperature),
         "model_weights": model_weights,
         "n_estimators": float(args.n_estimators),
         "max_depth": float(args.max_depth),
+        "extra_trees_estimators": float(extra_trees_estimators),
+        "random_forest_estimators": float(random_forest_estimators),
+        "hist_gradient_estimators": float(hist_gradient_estimators),
+        "extra_trees_max_depth": float(extra_trees_max_depth),
+        "random_forest_max_depth": float(random_forest_max_depth),
+        "hist_gradient_max_depth": float(hist_gradient_max_depth),
         "learning_rate": float(args.learning_rate),
         **split_info,
     }
@@ -517,9 +451,7 @@ def main() -> None:
         f"framework={metadata.get('framework')} "
         f"split_strategy={metadata.get('split_strategy')} "
         f"holdout_dates={metadata.get('holdout_source_dates')} "
-        f"benchmark_rows={metadata.get('benchmark_rows')} "
-        f"aux_human_rows={metadata.get('aux_human_rows')} "
-        f"aux_human_calibration_rows={metadata.get('aux_human_calibration_rows')}"
+        f"benchmark_rows={metadata.get('benchmark_rows')}"
     )
     for key in (
         "roc_auc",

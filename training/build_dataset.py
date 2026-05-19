@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gzip
 import json
-import random
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +11,6 @@ from poker44_ml.features import chunk_features
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BENCHMARK_PATH = (
     REPO_ROOT / "hands_generator" / "evaluation_datas" / "training_benchmark.txt"
-)
-DEFAULT_HUMAN_PATH = (
-    REPO_ROOT / "hands_generator" / "human_hands" / "poker_hands_combined.json.gz"
 )
 
 
@@ -38,13 +34,6 @@ def resolve_benchmark_paths(path: str | Path | None) -> list[Path]:
     if not existing:
         raise FileNotFoundError(f"No benchmark files found for {path or DEFAULT_BENCHMARK_PATH}")
     return existing
-
-
-def resolve_human_path(path: str | Path | None) -> Path:
-    candidate = Path(path) if path else DEFAULT_HUMAN_PATH
-    if not candidate.exists():
-        raise FileNotFoundError(f"Human baseline file not found: {candidate}")
-    return candidate
 
 
 def _as_root(payload: Any) -> Any:
@@ -128,63 +117,4 @@ def load_benchmark_examples(paths: str | Path | list[str | Path]) -> list[dict[s
             examples.append(example)
     if not examples:
         raise RuntimeError("No benchmark examples loaded.")
-    return examples
-
-
-def load_human_hands(path: str | Path) -> list[dict[str, Any]]:
-    payload = load_json_or_gz(path)
-    root = _as_root(payload)
-    if isinstance(root, list):
-        return [hand for hand in root if isinstance(hand, dict)]
-
-    hands: list[dict[str, Any]] = []
-    for group in _iter_release_groups(payload):
-        for chunk in group.get("chunks") or []:
-            if not isinstance(chunk, list):
-                continue
-            hands.extend(hand for hand in chunk if isinstance(hand, dict))
-    if not hands:
-        raise RuntimeError(f"No human hands found in {path}")
-    return hands
-
-
-def build_human_chunk_examples(
-    human_hands: list[dict[str, Any]],
-    *,
-    chunk_sizes: list[int],
-    count: int,
-    min_chunk_size: int = 20,
-    seed: int = 42,
-    source_path: str = "",
-) -> list[dict[str, Any]]:
-    if not human_hands or count <= 0:
-        return []
-    sizes = [max(min_chunk_size, int(size)) for size in chunk_sizes if int(size) > 0]
-    if not sizes:
-        sizes = [80]
-
-    rng = random.Random(seed)
-    examples: list[dict[str, Any]] = []
-    max_start = max(0, len(human_hands) - min(sizes))
-    for item_index in range(count):
-        size = rng.choice(sizes)
-        if len(human_hands) <= size:
-            chunk = list(human_hands)
-        else:
-            start = rng.randint(0, max(0, min(max_start, len(human_hands) - size)))
-            chunk = list(human_hands[start : start + size])
-        if len(chunk) < min_chunk_size:
-            continue
-        examples.append(
-            {
-                "chunk": chunk,
-                "label": 0,
-                "source_date": "human_baseline",
-                "group_id": "human_baseline",
-                "group_hash": "",
-                "item_index": item_index,
-                "source_path": source_path,
-                "features": _feature_row(chunk),
-            }
-        )
     return examples

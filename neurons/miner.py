@@ -119,36 +119,20 @@ class Miner(BaseMinerNeuron):
             else runtime_repo_url
         ) or runtime_repo_url
         model_metadata = dict(self.predictor.metadata) if self.predictor is not None else {}
-        aux_human_rows = int(float(model_metadata.get("aux_human_rows", 0.0) or 0.0))
-        aux_human_calibration_rows = int(
-            float(model_metadata.get("aux_human_calibration_rows", 0.0) or 0.0)
-        )
         benchmark_rows = int(float(model_metadata.get("benchmark_rows", 0.0) or 0.0))
         ensemble_combiner = str(model_metadata.get("ensemble_combiner", "") or "").strip()
         ensemble_max_blend = model_metadata.get("ensemble_max_blend")
-        feature_distance_calibrator = model_metadata.get("feature_distance_calibrator") or {}
         score_expansion = model_metadata.get("score_expansion") or {}
         score_remap = model_metadata.get("score_remap") or {}
         score_logit_bias = model_metadata.get("score_logit_bias")
         score_logit_temperature = model_metadata.get("score_logit_temperature")
-        trained_with_aux_humans = aux_human_rows > 0 or aux_human_calibration_rows > 0
         supervised_notes = (
             "Supervised benchmark model trained on released evaluation chunks"
         )
-        if trained_with_aux_humans:
-            supervised_notes += (
-                " plus a human-only baseline corpus for human-safety calibration"
-            )
         if ensemble_combiner:
             supervised_notes += f"; ensemble_combiner={ensemble_combiner}"
             if ensemble_max_blend is not None:
                 supervised_notes += f", ensemble_max_blend={ensemble_max_blend}"
-        if feature_distance_calibrator:
-            supervised_notes += (
-                "; feature_distance_calibrator="
-                f"{feature_distance_calibrator.get('kind', 'enabled')}"
-                f" blend={feature_distance_calibrator.get('blend', 'unknown')}"
-            )
         if score_expansion:
             supervised_notes += f"; score_expansion={score_expansion.get('kind', 'enabled')}"
         if score_remap:
@@ -166,16 +150,8 @@ class Miner(BaseMinerNeuron):
             if self.predictor is not None
             else "Reference heuristic miner. No training step. Uses only runtime chunk features."
         )
-        if self.predictor is not None and trained_with_aux_humans:
-            training_data_statement += (
-                f" Added {aux_human_rows} auxiliary human-only training chunks"
-                f" and {aux_human_calibration_rows} auxiliary human-only calibration chunks"
-                " from hands_generator/human_hands/poker_hands_combined.json.gz."
-            )
         training_data_sources = (
-            ["released_training_benchmark", "human_only_baseline_corpus"]
-            if self.predictor is not None and trained_with_aux_humans
-            else (["released_training_benchmark"] if self.predictor is not None else ["none"])
+            ["released_training_benchmark"] if self.predictor is not None else ["none"]
         )
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
@@ -186,16 +162,12 @@ class Miner(BaseMinerNeuron):
             ],
             defaults={
                 "model_name": (
-                    "poker44_benchmark_supervised_human_baseline"
-                    if trained_with_aux_humans
-                    else "poker44_benchmark_supervised"
+                    "poker44_benchmark_supervised"
                     if self.predictor is not None
                     else "poker44-reference-heuristic"
                 ),
                 "model_version": (
-                    "human-baseline-logit-bias-v2"
-                    if trained_with_aux_humans
-                    else ("1" if self.predictor is not None else "2")
+                    "1" if self.predictor is not None else "2"
                 ),
                 "framework": (
                     self.predictor.metadata.get("framework", "benchmark-supervised")
@@ -216,8 +188,7 @@ class Miner(BaseMinerNeuron):
                 "training_data_sources": training_data_sources,
                 "private_data_attestation": (
                     "No validator-private data used. Supervised artifacts use "
-                    "released benchmark labels"
-                    " and, when present, local human-only baseline hands."
+                    "released benchmark labels."
                 ),
             },
         )

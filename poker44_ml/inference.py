@@ -33,7 +33,6 @@ class Poker44Model:
         self.feature_names = list(artifact.get("feature_names") or [])
         self.metadata = dict(artifact.get("metadata") or {})
         self.calibrator = artifact.get("calibrator")
-        self.human_guard = dict(self.metadata.get("human_guard") or {})
         self.score_logit_bias = float(self.metadata.get("score_logit_bias", 0.0) or 0.0)
         self.score_logit_temperature = max(
             float(self.metadata.get("score_logit_temperature", 1.0) or 1.0),
@@ -100,25 +99,6 @@ class Poker44Model:
             return [self._clamp01(value) for value in self.calibrator.transform(scores)]
         return [self._clamp01(value) for value in scores]
 
-    def _apply_human_guard(self, scores: list[float]) -> list[float]:
-        if not scores or not self.human_guard:
-            return [self._clamp01(value) for value in scores]
-        try:
-            anchor = float(self.human_guard.get("anchor", 0.0))
-            softness = max(float(self.human_guard.get("softness", 1.0)), 1e-6)
-            strength = min(max(float(self.human_guard.get("strength", 0.0)), 0.0), 1.0)
-        except (TypeError, ValueError):
-            return [self._clamp01(value) for value in scores]
-        if strength <= 0.0:
-            return [self._clamp01(value) for value in scores]
-
-        guarded: list[float] = []
-        for value in scores:
-            score = self._clamp01(value)
-            human_like = 1.0 / (1.0 + math.exp((score - anchor) / softness))
-            guarded.append(self._clamp01(score * (1.0 - strength * human_like)))
-        return guarded
-
     def _apply_score_logit(self, scores: list[float]) -> list[float]:
         if not scores:
             return []
@@ -139,8 +119,7 @@ class Poker44Model:
         raw_scores = self._raw_model_scores(rows)
         calibrated_scores = self._apply_calibrator(raw_scores)
         logit_scores = self._apply_score_logit(calibrated_scores)
-        guarded_scores = self._apply_human_guard(logit_scores)
-        return [round(self._clamp01(value), 6) for value in guarded_scores]
+        return [round(self._clamp01(value), 6) for value in logit_scores]
 
     def predict_chunk_score(self, chunk: list[dict[str, Any]]) -> float:
         scores = self.predict_chunk_scores([chunk])
@@ -156,12 +135,11 @@ class Poker44Model:
         raw_scores = self._raw_model_scores(rows)
         calibrated_scores = self._apply_calibrator(raw_scores)
         logit_scores = self._apply_score_logit(calibrated_scores)
-        final_scores = self._apply_human_guard(logit_scores)
         return {
             "raw_scores": [round(value, 6) for value in raw_scores],
             "calibrated_scores": [round(value, 6) for value in calibrated_scores],
             "logit_scores": [round(value, 6) for value in logit_scores],
-            "final_scores": [round(value, 6) for value in final_scores],
+            "final_scores": [round(value, 6) for value in logit_scores],
         }
 
     def benchmark_latency(
@@ -180,6 +158,3 @@ class Poker44Model:
             "latency_per_chunk_ms": elapsed_ms / max(len(chunks), 1),
             "total_latency_ms": elapsed_ms,
         }
-
-
-HumanBaselineModel = Poker44Model
