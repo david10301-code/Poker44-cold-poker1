@@ -131,6 +131,34 @@ def _iqr(values: list[float]) -> float:
     return _quantile(values, 0.75) - _quantile(values, 0.25)
 
 
+def _numeric_mean(values: list[float]) -> float:
+    return safe_div(sum(values), len(values)) if values else 0.0
+
+
+def _rate_at_least(values: list[float], threshold: float) -> float:
+    return safe_div(sum(1 for value in values if value >= threshold), len(values))
+
+
+def _rate_at_most(values: list[float], threshold: float) -> float:
+    return safe_div(sum(1 for value in values if value <= threshold), len(values))
+
+
+def _amount_bucket(value: float) -> str:
+    if value <= 0.0:
+        return "z"
+    if value <= 0.5:
+        return "xs"
+    if value <= 1.0:
+        return "s"
+    if value <= 2.5:
+        return "m"
+    if value <= 5.0:
+        return "l"
+    if value <= 12.0:
+        return "xl"
+    return "xxl"
+
+
 def _hand_feature_values(hand: dict[str, Any]) -> tuple[float, ...]:
     actions = hand.get("actions") or []
     players = hand.get("players") or []
@@ -349,6 +377,7 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     positive_sums = [0.0] * feature_count
     positive_sums_sq = [0.0] * feature_count
     positive_counts = [0] * feature_count
+    feature_series: list[list[float]] = [[] for _ in range(feature_count)]
     showdown_total = 0.0
     deep_street_count = 0
     passive_style_count = 0
@@ -361,6 +390,11 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     actor_signatures: list[tuple[int, ...]] = []
     street_signatures: list[tuple[str, ...]] = []
     amount_signatures: list[tuple[float, ...]] = []
+    action_amount_signatures: list[tuple[tuple[str, str], ...]] = []
+    actor_action_signatures: list[tuple[tuple[int, str], ...]] = []
+    preflop_action_signatures: list[tuple[str, ...]] = []
+    preflop_actor_signatures: list[tuple[int, ...]] = []
+    street_action_signatures: list[tuple[tuple[str, str], ...]] = []
     action_counts: list[float] = []
     actor_entropies: list[float] = []
     action_entropies: list[float] = []
@@ -372,6 +406,12 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     action_transition_entropies: list[float] = []
     zero_amount_noncheck_shares: list[float] = []
     repeated_amount_shares: list[float] = []
+    first_action_aggressive_flags: list[float] = []
+    last_action_aggressive_flags: list[float] = []
+    fold_after_aggression_flags: list[float] = []
+    preflop_raise_flags: list[float] = []
+    postflop_aggression_shares: list[float] = []
+    action_length_signatures: list[tuple[int, ...]] = []
     hero_seats: list[int] = []
     button_seats: list[int] = []
     player_counts: list[int] = []
@@ -402,12 +442,36 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
             for action in actions
             if isinstance(action, dict)
         ]
+        amount_buckets = [_amount_bucket(value) for value in amount_sequence]
+        street_action_pairs = tuple(zip(street_sequence, action_types))
+        action_amount_pairs = tuple(zip(action_types, amount_buckets))
+        actor_action_pairs = tuple(zip(actor_sequence, action_types))
+        preflop_actions = [
+            action_type
+            for action_type, street_name in zip(action_types, street_sequence)
+            if street_name == "preflop"
+        ]
+        preflop_actors = [
+            actor
+            for actor, street_name in zip(actor_sequence, street_sequence)
+            if street_name == "preflop"
+        ]
+        postflop_actions = [
+            action_type
+            for action_type, street_name in zip(action_types, street_sequence)
+            if street_name not in {"", "preflop"}
+        ]
         bigrams = tuple(zip(action_types, action_types[1:]))
         action_signatures.append(tuple(action_types))
         action_bigram_signatures.append(bigrams)
         actor_signatures.append(tuple(actor_sequence))
         street_signatures.append(tuple(street_sequence))
         amount_signatures.append(tuple(amount_sequence))
+        action_amount_signatures.append(action_amount_pairs)
+        actor_action_signatures.append(actor_action_pairs)
+        preflop_action_signatures.append(tuple(preflop_actions))
+        preflop_actor_signatures.append(tuple(preflop_actors))
+        street_action_signatures.append(street_action_pairs)
         action_counts.append(float(len(actions)))
         actor_entropies.append(_categorical_entropy(actor_sequence))
         action_entropies.append(_categorical_entropy(action_types))
@@ -433,6 +497,30 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
             )
         )
         repeated_amount_shares.append(max(0.0, 1.0 - _unique_share(amount_sequence)))
+        first_action_aggressive_flags.append(
+            float(bool(action_types) and action_types[0] in {"bet", "raise"})
+        )
+        last_action_aggressive_flags.append(
+            float(bool(action_types) and action_types[-1] in {"bet", "raise"})
+        )
+        fold_after_aggression_flags.append(
+            float(
+                any(
+                    curr == "fold" and prev in {"bet", "raise"}
+                    for prev, curr in zip(action_types, action_types[1:])
+                )
+            )
+        )
+        preflop_raise_flags.append(float("raise" in preflop_actions))
+        postflop_aggression_shares.append(
+            safe_div(
+                sum(1 for action_type in postflop_actions if action_type in {"bet", "raise"}),
+                len(postflop_actions),
+            )
+        )
+        action_length_signatures.append(
+            tuple(len(tuple(group)) for group in (preflop_actions, postflop_actions))
+        )
         hero_seats.append(int(metadata.get("hero_seat") or 0))
         button_seats.append(int(metadata.get("button_seat") or 0))
         player_counts.append(len(players))
@@ -448,8 +536,8 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
         aggressive_share = values[14]
         passive_share = values[15]
         action_diversity = values[7]
-        normalized_amount_mean_bb = values[22]
-        hero_is_button = values[35]
+        normalized_amount_mean_bb = values[23]
+        hero_is_button = values[36]
         showdown_total += showdown_flag
         deep_street_count += int(street_depth >= 0.75)
         passive_style_count += int(passive_share >= 0.55)
@@ -469,6 +557,7 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
                 positive_sums[idx] += value
                 positive_sums_sq[idx] += value * value
                 positive_counts[idx] += 1
+            feature_series[idx].append(value)
 
     hand_total = float(len(chunk))
     for idx, feature_name in enumerate(FEATURE_NAMES):
@@ -490,6 +579,36 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
             )
             output[f"{feature_name}_cv"] = safe_div(math.sqrt(positive_variance), positive_mean)
 
+    distribution_features = {
+        "action_entropy",
+        "total_actions",
+        "aggressive_action_share",
+        "passive_action_share",
+        "unique_actor_share",
+        "repeated_actor_share",
+        "zero_amount_action_share",
+        "normalized_amount_mean_bb",
+        "normalized_amount_max_bb",
+        "normalized_amount_std_bb",
+        "pot_growth_bb",
+        "pot_growth_per_action_bb",
+        "raise_to_max_bb",
+        "call_to_max_bb",
+        "starting_stack_mean_bb",
+        "starting_stack_std_bb",
+        "rake_to_pot_ratio",
+        "hero_position_signal",
+        "players_to_flop_signal",
+    }
+    for idx, feature_name in enumerate(FEATURE_NAMES):
+        if feature_name not in distribution_features:
+            continue
+        values = feature_series[idx]
+        output[f"{feature_name}_q10"] = _quantile(values, 0.10)
+        output[f"{feature_name}_q50"] = _quantile(values, 0.50)
+        output[f"{feature_name}_q90"] = _quantile(values, 0.90)
+        output[f"{feature_name}_iqr"] = _iqr(values)
+
     output["showdown_rate"] = showdown_total / hand_total
     output["deep_street_rate"] = deep_street_count / hand_total
     output["passive_style_rate"] = passive_style_count / hand_total
@@ -507,6 +626,18 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     output["unique_street_signature_share"] = _unique_share(street_signatures)
     output["top_amount_signature_share"] = _top_share(amount_signatures)
     output["unique_amount_signature_share"] = _unique_share(amount_signatures)
+    output["top_action_amount_signature_share"] = _top_share(action_amount_signatures)
+    output["unique_action_amount_signature_share"] = _unique_share(action_amount_signatures)
+    output["top_actor_action_signature_share"] = _top_share(actor_action_signatures)
+    output["unique_actor_action_signature_share"] = _unique_share(actor_action_signatures)
+    output["top_preflop_action_signature_share"] = _top_share(preflop_action_signatures)
+    output["unique_preflop_action_signature_share"] = _unique_share(preflop_action_signatures)
+    output["top_preflop_actor_signature_share"] = _top_share(preflop_actor_signatures)
+    output["unique_preflop_actor_signature_share"] = _unique_share(preflop_actor_signatures)
+    output["top_street_action_signature_share"] = _top_share(street_action_signatures)
+    output["unique_street_action_signature_share"] = _unique_share(street_action_signatures)
+    output["top_action_length_signature_share"] = _top_share(action_length_signatures)
+    output["unique_action_length_signature_share"] = _unique_share(action_length_signatures)
     output["action_count_iqr"] = _iqr(action_counts)
     output["action_count_unique_share"] = _unique_share(action_counts)
     output["actor_entropy_mean"] = safe_div(sum(actor_entropies), hand_total)
@@ -523,6 +654,21 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     output["action_transition_entropy_mean"] = safe_div(sum(action_transition_entropies), hand_total)
     output["zero_amount_noncheck_share_mean"] = safe_div(sum(zero_amount_noncheck_shares), hand_total)
     output["repeated_amount_share_mean"] = safe_div(sum(repeated_amount_shares), hand_total)
+    output["first_action_aggressive_rate"] = _numeric_mean(first_action_aggressive_flags)
+    output["last_action_aggressive_rate"] = _numeric_mean(last_action_aggressive_flags)
+    output["fold_after_aggression_rate"] = _numeric_mean(fold_after_aggression_flags)
+    output["preflop_raise_rate"] = _numeric_mean(preflop_raise_flags)
+    output["postflop_aggression_share_mean"] = _numeric_mean(postflop_aggression_shares)
+    output["postflop_aggression_share_iqr"] = _iqr(postflop_aggression_shares)
+    output["short_hand_rate"] = _rate_at_most(action_counts, 6.0)
+    output["long_hand_rate"] = _rate_at_least(action_counts, 18.0)
+    output["very_long_hand_rate"] = _rate_at_least(action_counts, 28.0)
+    output["low_action_entropy_rate"] = _rate_at_most(action_entropies, 0.35)
+    output["high_action_entropy_rate"] = _rate_at_least(action_entropies, 0.85)
+    output["low_actor_entropy_rate"] = _rate_at_most(actor_entropies, 0.45)
+    output["high_actor_switch_rate"] = _rate_at_least(actor_switch_rates, 0.85)
+    output["high_repeated_amount_rate"] = _rate_at_least(repeated_amount_shares, 0.65)
+    output["zero_amount_noncheck_rate"] = _rate_at_least(zero_amount_noncheck_shares, 0.05)
     output["hero_seat_entropy"] = _categorical_entropy(hero_seats)
     output["button_seat_entropy"] = _categorical_entropy(button_seats)
     output["player_count_unique_share"] = _unique_share(player_counts)
