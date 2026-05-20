@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from poker44_ml.features import chunk_features
 
 try:
@@ -92,6 +94,16 @@ class Poker44Model:
     def _apply_calibrator(self, scores: list[float]) -> list[float]:
         if not scores or self.calibrator is None:
             return [self._clamp01(value) for value in scores]
+        if isinstance(self.calibrator, dict) and self.calibrator.get("kind") == "threshold_logit_v1":
+            try:
+                threshold = float(self.calibrator.get("threshold", 0.5))
+                temperature = max(float(self.calibrator.get("temperature", 0.08)), 1e-6)
+            except (TypeError, ValueError):
+                return [self._clamp01(value) for value in scores]
+            return [
+                self._clamp01(1.0 / (1.0 + np.exp(-((float(value) - threshold) / temperature))))
+                for value in scores
+            ]
         if hasattr(self.calibrator, "predict_proba"):
             calibrated = self.calibrator.predict_proba([[float(value)] for value in scores])
             return [self._clamp01(row[1]) for row in calibrated]

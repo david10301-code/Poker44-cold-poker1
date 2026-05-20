@@ -56,6 +56,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--holdout-source-dates", type=str, default=None)
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--calibration-size", type=float, default=0.2)
+    parser.add_argument(
+        "--calibration-seed",
+        type=int,
+        default=None,
+        help="Random seed for the calibration split. Defaults to --seed.",
+    )
+    parser.add_argument(
+        "--calibration-method",
+        choices=("logistic", "threshold_logit", "none"),
+        default="logistic",
+    )
+    parser.add_argument(
+        "--threshold-calibration-temperature",
+        type=float,
+        default=0.08,
+        help="Sigmoid temperature for threshold_logit calibration. Smaller is sharper.",
+    )
+    parser.add_argument(
+        "--threshold-calibration-human-quantile",
+        type=float,
+        default=1.0,
+        help="Human score quantile used to set the threshold_logit midpoint.",
+    )
+    parser.add_argument(
+        "--threshold-calibration-bot-quantile",
+        type=float,
+        default=0.0,
+        help="Bot score quantile used to set the threshold_logit midpoint.",
+    )
+    parser.add_argument(
+        "--threshold-calibration-aggregation",
+        choices=("quantile", "trimmed_mean", "tail_mean"),
+        default="quantile",
+        help=(
+            "quantile uses the quantile point as anchor; trimmed_mean averages "
+            "humans <= human quantile and bots >= bot quantile; tail_mean "
+            "averages humans >= human quantile and bots <= bot quantile."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-estimators", type=int, default=700)
     parser.add_argument("--max-depth", type=int, default=9)
@@ -65,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extra-trees-max-depth", type=int, default=None)
     parser.add_argument("--random-forest-max-depth", type=int, default=None)
     parser.add_argument("--hist-gradient-max-depth", type=int, default=None)
-    parser.add_argument("--learning-rate", type=float, default=0.04)
+    parser.add_argument("--learning-rate", type=float, default=0.03)
     parser.add_argument("--extra-trees-weight", type=float, default=0.45)
     parser.add_argument("--random-forest-weight", type=float, default=0.25)
     parser.add_argument("--hist-gradient-weight", type=float, default=0.30)
@@ -191,7 +230,7 @@ def _model_scores(models: list[object], weights: list[float], rows: list[list[fl
     ]
 
 
-def _fit_calibrator(labels: list[int], scores: list[float]) -> object | None:
+def _fit_logistic_calibrator(labels: list[int], scores: list[float]) -> object | None:
     if len(set(int(label) for label in labels)) < 2:
         return None
     calibrator = LogisticRegression(solver="lbfgs", random_state=42)
@@ -199,9 +238,67 @@ def _fit_calibrator(labels: list[int], scores: list[float]) -> object | None:
     return calibrator
 
 
+def _fit_threshold_logit_calibrator(
+    labels: list[int],
+    scores: list[float],
+    *,
+    temperature: float,
+    human_quantile: float,
+    bot_quantile: float,
+    aggregation: str,
+) -> dict[str, float] | None:
+    humans = [float(score) for label, score in zip(labels, scores) if int(label) == 0]
+    bots = [float(score) for label, score in zip(labels, scores) if int(label) == 1]
+    if not humans or not bots:
+        return None
+    human_q = min(max(float(human_quantile), 0.0), 1.0)
+    bot_q = min(max(float(bot_quantile), 0.0), 1.0)
+    human_values = np.asarray(humans, dtype=float)
+    bot_values = np.asarray(bots, dtype=float)
+    human_cutoff = float(np.quantile(human_values, human_q))
+    bot_cutoff = float(np.quantile(bot_values, bot_q))
+    if aggregation == "trimmed_mean":
+        trimmed_humans = human_values[human_values <= human_cutoff]
+        trimmed_bots = bot_values[bot_values >= bot_cutoff]
+        if len(trimmed_humans) == 0 or len(trimmed_bots) == 0:
+            return None
+        human_anchor = float(np.mean(trimmed_humans))
+        bot_anchor = float(np.mean(trimmed_bots))
+    elif aggregation == "tail_mean":
+        tail_humans = human_values[human_values >= human_cutoff]
+        tail_bots = bot_values[bot_values <= bot_cutoff]
+        if len(tail_humans) == 0 or len(tail_bots) == 0:
+            return None
+        human_anchor = float(np.mean(tail_humans))
+        bot_anchor = float(np.mean(tail_bots))
+    else:
+        human_anchor = human_cutoff
+        bot_anchor = bot_cutoff
+    threshold = 0.5 * (human_anchor + bot_anchor)
+    return {
+        "kind": "threshold_logit_v1",
+        "threshold": threshold,
+        "temperature": max(float(temperature), 1e-6),
+        "human_anchor": human_anchor,
+        "bot_anchor": bot_anchor,
+        "human_cutoff": human_cutoff,
+        "bot_cutoff": bot_cutoff,
+        "human_quantile": human_q,
+        "bot_quantile": bot_q,
+        "aggregation": str(aggregation),
+    }
+
+
 def _apply_calibrator(calibrator: object | None, scores: list[float]) -> list[float]:
     if calibrator is None:
         return [max(0.0, min(1.0, float(score))) for score in scores]
+    if isinstance(calibrator, dict) and calibrator.get("kind") == "threshold_logit_v1":
+        threshold = float(calibrator.get("threshold", 0.5))
+        temperature = max(float(calibrator.get("temperature", 0.08)), 1e-6)
+        return [
+            float(1.0 / (1.0 + np.exp(-((float(score) - threshold) / temperature))))
+            for score in scores
+        ]
     probabilities = calibrator.predict_proba([[float(score)] for score in scores])
     return [max(0.0, min(1.0, float(row[1]))) for row in probabilities]
 
@@ -326,7 +423,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     fit_examples, calibration_examples = _split_calibration(
         train_examples,
         calibration_size=args.calibration_size,
-        seed=args.seed,
+        seed=int(args.calibration_seed if args.calibration_seed is not None else args.seed),
     )
 
     benchmark_feature_rows = [example["features"] for example in benchmark_examples]
@@ -383,9 +480,29 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         float(args.hist_gradient_weight),
     ]
     raw_cal = _model_scores(models, model_weights, X_cal) if X_cal else []
-    calibrator = _fit_calibrator(y_cal, raw_cal) if raw_cal and len(set(y_cal)) >= 2 else None
+    calibrator = None
+    if raw_cal and len(set(y_cal)) >= 2:
+        if args.calibration_method == "logistic":
+            calibrator = _fit_logistic_calibrator(y_cal, raw_cal)
+        elif args.calibration_method == "threshold_logit":
+            calibrator = _fit_threshold_logit_calibrator(
+                y_cal,
+                raw_cal,
+                temperature=args.threshold_calibration_temperature,
+                human_quantile=args.threshold_calibration_human_quantile,
+                bot_quantile=args.threshold_calibration_bot_quantile,
+                aggregation=args.threshold_calibration_aggregation,
+            )
 
     raw_test = _model_scores(models, model_weights, X_test)
+    post_test_calibrator = _fit_threshold_logit_calibrator(
+        y_test,
+        raw_test,
+        temperature=args.threshold_calibration_temperature,
+        human_quantile=args.threshold_calibration_human_quantile,
+        bot_quantile=args.threshold_calibration_bot_quantile,
+        aggregation=args.threshold_calibration_aggregation,
+    )
     calibrated_test = _apply_calibrator(calibrator, raw_test)
     logit_test = _apply_score_logit(
         calibrated_test,
@@ -406,6 +523,16 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "benchmark_chunk_sizes": ",".join(str(size) for size in benchmark_chunk_sizes),
         "train_rows": float(len(X_fit)),
         "calibration_rows": float(len(X_cal)),
+        "calibration_method": str(args.calibration_method),
+        "calibration_seed": float(
+            args.calibration_seed if args.calibration_seed is not None else args.seed
+        ),
+        "threshold_calibration_temperature": float(args.threshold_calibration_temperature),
+        "threshold_calibration_human_quantile": float(args.threshold_calibration_human_quantile),
+        "threshold_calibration_bot_quantile": float(args.threshold_calibration_bot_quantile),
+        "threshold_calibration_aggregation": str(args.threshold_calibration_aggregation),
+        "calibrator": calibrator if isinstance(calibrator, dict) else {},
+        "post_test_calibrator": post_test_calibrator if isinstance(post_test_calibrator, dict) else {},
         "test_rows": float(len(X_test)),
         "score_logit_bias": float(args.score_logit_bias),
         "score_logit_temperature": float(args.score_logit_temperature),
@@ -453,6 +580,36 @@ def main() -> None:
         f"holdout_dates={metadata.get('holdout_source_dates')} "
         f"benchmark_rows={metadata.get('benchmark_rows')}"
     )
+    calibrator = metadata.get("calibrator")
+    if isinstance(calibrator, dict) and calibrator.get("kind") == "threshold_logit_v1":
+        print(
+            "Calibration threshold: "
+            f"kind={calibrator.get('kind')} "
+            f"threshold={float(calibrator.get('threshold', 0.0)):.6f} "
+            f"temperature={float(calibrator.get('temperature', 0.0)):.6f} "
+            f"human_anchor={float(calibrator.get('human_anchor', 0.0)):.6f} "
+            f"bot_anchor={float(calibrator.get('bot_anchor', 0.0)):.6f} "
+            f"human_cutoff={float(calibrator.get('human_cutoff', 0.0)):.6f} "
+            f"bot_cutoff={float(calibrator.get('bot_cutoff', 0.0)):.6f} "
+            f"human_quantile={float(calibrator.get('human_quantile', 0.0)):.6f} "
+            f"bot_quantile={float(calibrator.get('bot_quantile', 0.0)):.6f} "
+            f"aggregation={calibrator.get('aggregation', 'quantile')}"
+        )
+    post_test_calibrator = metadata.get("post_test_calibrator")
+    if isinstance(post_test_calibrator, dict) and post_test_calibrator.get("kind") == "threshold_logit_v1":
+        print(
+            "Post-test threshold (evaluation only): "
+            f"kind={post_test_calibrator.get('kind')} "
+            f"threshold={float(post_test_calibrator.get('threshold', 0.0)):.6f} "
+            f"temperature={float(post_test_calibrator.get('temperature', 0.0)):.6f} "
+            f"human_anchor={float(post_test_calibrator.get('human_anchor', 0.0)):.6f} "
+            f"bot_anchor={float(post_test_calibrator.get('bot_anchor', 0.0)):.6f} "
+            f"human_cutoff={float(post_test_calibrator.get('human_cutoff', 0.0)):.6f} "
+            f"bot_cutoff={float(post_test_calibrator.get('bot_cutoff', 0.0)):.6f} "
+            f"human_quantile={float(post_test_calibrator.get('human_quantile', 0.0)):.6f} "
+            f"bot_quantile={float(post_test_calibrator.get('bot_quantile', 0.0)):.6f} "
+            f"aggregation={post_test_calibrator.get('aggregation', 'quantile')}"
+        )
     for key in (
         "roc_auc",
         "pr_auc",

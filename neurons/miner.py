@@ -126,6 +126,11 @@ class Miner(BaseMinerNeuron):
         score_remap = model_metadata.get("score_remap") or {}
         score_logit_bias = model_metadata.get("score_logit_bias")
         score_logit_temperature = model_metadata.get("score_logit_temperature")
+        threshold_calibrator = (
+            model_metadata.get("calibrator")
+            if isinstance(model_metadata.get("calibrator"), dict)
+            else {}
+        )
         supervised_notes = (
             "Supervised benchmark model trained on released evaluation chunks"
         )
@@ -140,10 +145,29 @@ class Miner(BaseMinerNeuron):
                 f"; score_remap={score_remap.get('kind', 'enabled')} "
                 f"threshold={score_remap.get('threshold', 'unknown')}"
             )
+        if threshold_calibrator.get("kind") == "threshold_logit_v1":
+            supervised_notes += (
+                "; threshold_logit_calibration="
+                f"threshold={threshold_calibrator.get('threshold', 'unknown')}"
+                f", temperature={threshold_calibrator.get('temperature', 'unknown')}"
+            )
         if score_logit_bias is not None:
             supervised_notes += (
                 f"; score_logit_bias={score_logit_bias}"
                 f", score_logit_temperature={score_logit_temperature or 1.0}"
+            )
+        if threshold_calibrator.get("kind") == "threshold_logit_v1":
+            bt.logging.info(
+                "Loaded threshold-logit calibration | "
+                f"threshold={threshold_calibrator.get('threshold')} "
+                f"temperature={threshold_calibrator.get('temperature')} "
+                f"human_anchor={threshold_calibrator.get('human_anchor')} "
+                f"bot_anchor={threshold_calibrator.get('bot_anchor')} "
+                f"human_cutoff={threshold_calibrator.get('human_cutoff')} "
+                f"bot_cutoff={threshold_calibrator.get('bot_cutoff')} "
+                f"human_quantile={threshold_calibrator.get('human_quantile')} "
+                f"bot_quantile={threshold_calibrator.get('bot_quantile')} "
+                f"aggregation={threshold_calibrator.get('aggregation')}"
             )
         training_data_statement = (
             f"Trained on {benchmark_rows or 'released'} benchmark chunks with groundTruth labels."
