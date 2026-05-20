@@ -49,6 +49,7 @@ from training.build_dataset import (
     load_benchmark_examples,
     resolve_benchmark_paths,
 )
+from training.robust_features import filter_robust_feature_names, summarize_robust_filter
 
 try:
     import joblib
@@ -177,6 +178,22 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="If > 0, keep only the top-K features by LightGBM importance.",
+    )
+    parser.add_argument(
+        "--robust-features-only",
+        action="store_true",
+        help=(
+            "Keep only validator-generalized features (action mix, signatures, "
+            "entropy). Drops outcome/position/absolute-BB columns."
+        ),
+    )
+    parser.add_argument(
+        "--no-score-remap",
+        action="store_true",
+        help=(
+            "Do not tune or save score_remap; miner uses raw stacked scores only. "
+            "Recommended for live generalization."
+        ),
     )
     parser.add_argument(
         "--score-logit-bias-grid",
@@ -863,7 +880,22 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     )
     train_examples = fit_examples
 
-    feature_names = sorted(examples[0]["features"].keys())
+    all_feature_names = sorted(examples[0]["features"].keys())
+    if args.robust_features_only:
+        feature_names = filter_robust_feature_names(all_feature_names)
+        summary = summarize_robust_filter(all_feature_names, feature_names)
+        if len(feature_names) < 16:
+            raise RuntimeError(
+                f"--robust-features-only kept only {len(feature_names)} features; "
+                "check training/robust_features.py allowlist."
+            )
+        print(
+            "Robust feature filter: "
+            f"kept {summary['kept']}/{summary['total']} "
+            f"(dropped {summary['dropped']})"
+        )
+    else:
+        feature_names = all_feature_names
     x_train = _build_matrix(train_examples, feature_names)
     y_train = np.asarray(
         [int(example["label"]) for example in train_examples], dtype=np.int64
@@ -1016,10 +1048,10 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             )
         return stacked.predict_proba(x_rows)[:, 1]
 
-    # Tune score_remap on the calibration split (not the test holdout).
+    use_score_remap = not bool(args.no_score_remap)
     score_remap: Dict[str, Any] | None = None
     cal_metrics: Dict[str, float] = {}
-    if cal_examples:
+    if use_score_remap and cal_examples:
         y_cal = np.asarray(
             [int(example["label"]) for example in cal_examples], dtype=np.int64
         )
@@ -1038,13 +1070,15 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             f"cal_fpr={cal_metrics.get('validator_fpr', 0.0):.4f} "
             f"cal_recall={cal_metrics.get('validator_bot_recall', 0.0):.4f}"
         )
-    else:
+    elif use_score_remap:
         print("WARN: no calibration split; score_remap disabled.")
+    else:
+        print("score_remap disabled (--no-score-remap); using raw stacked scores.")
 
     test_raw = _stacked_raw_scores(test_examples)
     test_final = (
         _apply_score_remap_np(test_raw, score_remap)
-        if score_remap
+        if (use_score_remap and score_remap)
         else test_raw
     )
     raw_humans = test_raw[y_test == 0]
@@ -1105,6 +1139,11 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         "calibration_rows": float(len(cal_examples)),
         "miner_visible_payload": bool(miner_visible),
         "train_latest_days": float(args.train_latest_days),
+        "robust_features_only": bool(args.robust_features_only),
+        "robust_feature_count": float(
+            len(feature_names) if args.robust_features_only else 0
+        ),
+        "no_score_remap": bool(args.no_score_remap),
         "score_remap": dict(score_remap) if score_remap else {},
         "calibration_metrics": cal_metrics,
         "holdout_test_metrics": best["metrics"],
@@ -1112,7 +1151,11 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         "score_logit_bias": 0.0,
         "score_logit_temperature": 1.0,
         "model_weights": [1.0],
-        "ensemble_combiner": "stacking_logreg+isotonic+score_remap",
+        "ensemble_combiner": (
+            "stacking_logreg+isotonic+score_remap"
+            if (use_score_remap and score_remap)
+            else "stacking_logreg+isotonic"
+        ),
         **split_info,
     }
 

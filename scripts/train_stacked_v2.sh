@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Train the v2 stacked Poker44 model for live validator reward.
 #
+# Default: robust feature allowlist + no score_remap (generalization-focused).
+#
 # Usage:
 #   ./scripts/train_stacked_v2.sh
-#   OUTPUT=models/poker44_stacked_live.joblib ./scripts/train_stacked_v2.sh
+#   OUTPUT=models/poker44_stacked_robust.joblib ./scripts/train_stacked_v2.sh
 #   HOLDOUT_SOURCE_DATES=2026-05-08 EXCLUDE_TRAIN_SOURCE_DATES=2026-05-07 ./scripts/train_stacked_v2.sh
 #
-# After training, deploy only if diagnose_live_scores shows no CRITICAL flags:
-#   POKER44_MODEL_PATH=$(pwd)/models/poker44_stacked_live.joblib \
+# Legacy full-feature + score_remap training:
+#   ROBUST_FEATURES_ONLY=0 NO_SCORE_REMAP=0 ./scripts/train_stacked_v2.sh
+#
+# After training, deploy and check live calibration:
+#   POKER44_MODEL_PATH=$(pwd)/models/poker44_stacked_robust.joblib \
 #   POKER44_LOG_SCORE_COMPONENTS=1 pm2 restart wolf_miner_5 --update-env
 #   sleep 360
 #   python -m training.diagnose_live_scores --log ~/.pm2/logs/wolf-miner-5-out.log --last 1
@@ -16,7 +21,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-OUTPUT="${OUTPUT:-models/poker44_stacked_live.joblib}"
+OUTPUT="${OUTPUT:-models/poker44_stacked_robust.joblib}"
 HOLDOUT_SOURCE_DATES="${HOLDOUT_SOURCE_DATES:-2026-05-08}"
 EXCLUDE_TRAIN_SOURCE_DATES="${EXCLUDE_TRAIN_SOURCE_DATES:-2026-05-07}"
 TARGET_FPR="${TARGET_FPR:-0.04}"
@@ -27,6 +32,8 @@ N_FOLDS="${N_FOLDS:-5}"
 SEED="${SEED:-42}"
 MAX_FEATURES="${MAX_FEATURES:-0}"
 CALIBRATION_FRACTION="${CALIBRATION_FRACTION:-0.25}"
+ROBUST_FEATURES_ONLY="${ROBUST_FEATURES_ONLY:-1}"
+NO_SCORE_REMAP="${NO_SCORE_REMAP:-1}"
 
 EXTRA_ARGS=()
 if [[ -n "$HOLDOUT_SOURCE_DATES" ]]; then
@@ -64,6 +71,12 @@ if [[ "${ENABLE_SEQUENCE:-0}" == "1" ]]; then
 fi
 if [[ "${NO_MINER_VISIBLE:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--no-miner-visible-payload)
+fi
+if [[ "$ROBUST_FEATURES_ONLY" == "1" ]]; then
+  EXTRA_ARGS+=(--robust-features-only)
+fi
+if [[ "$NO_SCORE_REMAP" == "1" ]]; then
+  EXTRA_ARGS+=(--no-score-remap)
 fi
 
 mkdir -p "$(dirname "$OUTPUT")" logs
