@@ -191,14 +191,19 @@ def parse_args() -> argparse.Namespace:
         "--no-score-remap",
         action="store_true",
         help=(
-            "Do not tune or save score_remap; miner uses raw stacked scores only. "
-            "Recommended for live generalization."
+            "Do not tune or save score_remap. Prefer score_logit_bias tuning instead "
+            "for low raw-score stacks."
         ),
+    )
+    parser.add_argument(
+        "--no-score-logit-tune",
+        action="store_true",
+        help="Skip score_logit bias/temperature grid search on the calibration split.",
     )
     parser.add_argument(
         "--score-logit-bias-grid",
         type=str,
-        default="-1.5,-1.0,-0.6,-0.3,0.0,0.3,0.6",
+        default="-1.0,-0.5,0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5",
         help="Comma-separated grid of additive logit biases to search.",
     )
     parser.add_argument(
@@ -683,6 +688,79 @@ def _grid(values: str) -> List[float]:
     return out or [0.0]
 
 
+def _select_score_logit_for_validator_reward(
+    labels: np.ndarray,
+    raw_scores: np.ndarray,
+    *,
+    target_fpr: float,
+    max_validator_fpr: float,
+    bias_grid: Sequence[float],
+    temp_grid: Sequence[float],
+) -> tuple[float, float, Dict[str, float]]:
+    """Tune logit shift on stacked OOF/cal scores for validator bot recall.
+
+    Optimizes lexicographically: bot_recall, bot_prob_min, validator_reward.
+    Negative biases are dropped when the bot score distribution is collapsed low,
+    because they maximize easy-split reward but hurt harder holdout dates.
+    """
+    labels = np.asarray(labels, dtype=int)
+    scores = np.asarray(raw_scores, dtype=float)
+    bot_scores = scores[labels == 1]
+    humans = scores[labels == 0]
+    conformal_bias = _conformal_bias_for_target_fpr(humans, target_fpr)
+    raw_bot_p10 = float(np.quantile(bot_scores, 0.10)) if bot_scores.size else 0.5
+    raw_bot_p50 = float(np.median(bot_scores)) if bot_scores.size else 0.5
+
+    candidates = sorted(
+        {
+            float(value)
+            for value in bias_grid
+            if abs(float(value)) <= 5.0
+        }
+        | {conformal_bias}
+        | {
+            conformal_bias + delta
+            for delta in (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0)
+        }
+    )
+    if raw_bot_p50 < 0.35 or raw_bot_p10 < 0.15:
+        candidates = [value for value in candidates if value >= -0.25]
+
+    best_key = (-1.0, -1.0, -1.0)
+    best_bias = float(conformal_bias)
+    best_temp = 1.0
+    best_metrics: Dict[str, float] = {}
+
+    for bias in candidates:
+        for temperature in temp_grid:
+            temperature = max(float(temperature), 1e-6)
+            shifted = _logit_shift(scores, bias, temperature)
+            metrics = _enrich_metrics(labels.tolist(), shifted.tolist())
+            if metrics.get("validator_fpr", 1.0) >= max_validator_fpr - 1e-9:
+                continue
+            if metrics.get("human_prob_max", 1.0) > 0.48:
+                continue
+            recall = float(metrics.get("validator_bot_recall", 0.0))
+            bot_min = float(metrics.get("bot_prob_min", 0.0))
+            val_reward = float(metrics.get("validator_reward", 0.0))
+            key = (recall, bot_min, val_reward)
+            if key > best_key or (
+                abs(key[0] - best_key[0]) < 1e-9
+                and abs(key[1] - best_key[1]) < 1e-9
+                and abs(key[2] - best_key[2]) < 1e-9
+                and float(bias) > best_bias
+            ):
+                best_key = key
+                best_bias = float(bias)
+                best_temp = float(temperature)
+                best_metrics = dict(metrics)
+                best_metrics["calibration_validator_reward"] = val_reward
+                best_metrics["tune_raw_bot_p10"] = raw_bot_p10
+                best_metrics["tune_raw_bot_p50"] = raw_bot_p50
+
+    return best_bias, best_temp, best_metrics
+
+
 def _conformal_bias_for_target_fpr(
     human_scores: np.ndarray, target_fpr: float, *, max_abs_bias: float = 5.0
 ) -> float:
@@ -1073,13 +1151,40 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     elif use_score_remap:
         print("WARN: no calibration split; score_remap disabled.")
     else:
-        print("score_remap disabled (--no-score-remap); using raw stacked scores.")
+        print("score_remap disabled (--no-score-remap).")
+
+    score_logit_bias = 0.0
+    score_logit_temperature = 1.0
+    logit_cal_metrics: Dict[str, float] = {}
+    if not args.no_score_logit_tune:
+        score_logit_bias, score_logit_temperature, logit_cal_metrics = (
+            _select_score_logit_for_validator_reward(
+                y_train,
+                calibrated_oof,
+                target_fpr=float(args.target_fpr),
+                max_validator_fpr=float(args.max_validator_fpr),
+                bias_grid=_grid(args.score_logit_bias_grid),
+                temp_grid=_grid(args.score_logit_temperature_grid),
+            )
+        )
+        print(
+            "OOF score_logit tune: "
+            f"bias={score_logit_bias:.4f} "
+            f"temperature={score_logit_temperature:.4f} "
+            f"oof_reward={logit_cal_metrics.get('calibration_validator_reward', 0.0):.4f} "
+            f"oof_fpr={logit_cal_metrics.get('validator_fpr', 0.0):.4f} "
+            f"oof_recall={logit_cal_metrics.get('validator_bot_recall', 0.0):.4f} "
+            f"oof_bot_prob_min={logit_cal_metrics.get('bot_prob_min', 0.0):.4f}"
+        )
 
     test_raw = _stacked_raw_scores(test_examples)
-    test_final = (
+    test_mid = (
         _apply_score_remap_np(test_raw, score_remap)
         if (use_score_remap and score_remap)
         else test_raw
+    )
+    test_final = _logit_shift(
+        test_mid, score_logit_bias, score_logit_temperature
     )
     raw_humans = test_raw[y_test == 0]
     raw_bots = test_raw[y_test == 1]
@@ -1091,8 +1196,8 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     test_metrics = _enrich_metrics(y_test.tolist(), test_final.tolist())
     best = {
         "reward": float(test_metrics.get("validator_reward", 0.0)),
-        "bias": 0.0,
-        "temperature": 1.0,
+        "bias": float(score_logit_bias),
+        "temperature": float(score_logit_temperature),
         "metrics": test_metrics,
     }
     print(
@@ -1144,17 +1249,18 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             len(feature_names) if args.robust_features_only else 0
         ),
         "no_score_remap": bool(args.no_score_remap),
+        "no_score_logit_tune": bool(args.no_score_logit_tune),
         "score_remap": dict(score_remap) if score_remap else {},
-        "calibration_metrics": cal_metrics,
+        "calibration_metrics": {**cal_metrics, **logit_cal_metrics},
         "holdout_test_metrics": best["metrics"],
         "raw_separation_q90_q10": float(raw_separation),
-        "score_logit_bias": 0.0,
-        "score_logit_temperature": 1.0,
+        "score_logit_bias": float(score_logit_bias),
+        "score_logit_temperature": float(score_logit_temperature),
         "model_weights": [1.0],
         "ensemble_combiner": (
-            "stacking_logreg+isotonic+score_remap"
+            "stacking_logreg+isotonic+score_remap+score_logit"
             if (use_score_remap and score_remap)
-            else "stacking_logreg+isotonic"
+            else "stacking_logreg+isotonic+score_logit"
         ),
         **split_info,
     }
