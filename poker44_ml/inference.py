@@ -50,6 +50,18 @@ class Poker44Model:
             float(self.metadata.get("score_logit_temperature", 1.0) or 1.0),
             1e-6,
         )
+        score_remap = self.metadata.get("score_remap")
+        if isinstance(score_remap, dict) and score_remap.get("kind"):
+            self.score_remap: dict[str, Any] = score_remap
+        elif (
+            isinstance(self.calibrator, dict)
+            and self.calibrator.get("kind") == "threshold_logit_v1"
+        ):
+            # Legacy artifacts stored score_remap in calibrator; apply once via score_remap.
+            self.score_remap = dict(self.calibrator)
+            self.calibrator = None
+        else:
+            self.score_remap = {}
         self.model_weights = list(
             artifact.get("model_weights")
             or self.metadata.get("model_weights")
@@ -124,22 +136,29 @@ class Poker44Model:
     def _apply_calibrator(self, scores: list[float]) -> list[float]:
         if not scores or self.calibrator is None:
             return [self._clamp01(value) for value in scores]
-        if isinstance(self.calibrator, dict) and self.calibrator.get("kind") == "threshold_logit_v1":
-            try:
-                threshold = float(self.calibrator.get("threshold", 0.5))
-                temperature = max(float(self.calibrator.get("temperature", 0.08)), 1e-6)
-            except (TypeError, ValueError):
-                return [self._clamp01(value) for value in scores]
-            return [
-                self._clamp01(1.0 / (1.0 + np.exp(-((float(value) - threshold) / temperature))))
-                for value in scores
-            ]
         if hasattr(self.calibrator, "predict_proba"):
             calibrated = self.calibrator.predict_proba([[float(value)] for value in scores])
             return [self._clamp01(row[1]) for row in calibrated]
         if hasattr(self.calibrator, "transform"):
             return [self._clamp01(value) for value in self.calibrator.transform(scores)]
         return [self._clamp01(value) for value in scores]
+
+    def _apply_score_remap(self, scores: list[float]) -> list[float]:
+        if not scores or not self.score_remap:
+            return [self._clamp01(value) for value in scores]
+        if self.score_remap.get("kind") != "threshold_logit_v1":
+            return [self._clamp01(value) for value in scores]
+        try:
+            threshold = float(self.score_remap.get("threshold", 0.5))
+            temperature = max(float(self.score_remap.get("temperature", 0.08)), 1e-6)
+        except (TypeError, ValueError):
+            return [self._clamp01(value) for value in scores]
+        output: list[float] = []
+        for value in scores:
+            clipped = max(1e-6, min(1.0 - 1e-6, float(value)))
+            adjusted = (clipped - threshold) / temperature
+            output.append(self._clamp01(1.0 / (1.0 + math.exp(-adjusted))))
+        return output
 
     def _apply_score_logit(self, scores: list[float]) -> list[float]:
         if not scores:
@@ -160,7 +179,8 @@ class Poker44Model:
         rows = self._aligned_rows(chunks)
         raw_scores = self._raw_model_scores(rows, chunks=chunks)
         calibrated_scores = self._apply_calibrator(raw_scores)
-        logit_scores = self._apply_score_logit(calibrated_scores)
+        remapped_scores = self._apply_score_remap(calibrated_scores)
+        logit_scores = self._apply_score_logit(remapped_scores)
         return [round(self._clamp01(value), 6) for value in logit_scores]
 
     def predict_chunk_score(self, chunk: list[dict[str, Any]]) -> float:
@@ -176,10 +196,12 @@ class Poker44Model:
         rows = self._aligned_rows(chunks)
         raw_scores = self._raw_model_scores(rows, chunks=chunks)
         calibrated_scores = self._apply_calibrator(raw_scores)
-        logit_scores = self._apply_score_logit(calibrated_scores)
+        remapped_scores = self._apply_score_remap(calibrated_scores)
+        logit_scores = self._apply_score_logit(remapped_scores)
         return {
             "raw_scores": [round(value, 6) for value in raw_scores],
             "calibrated_scores": [round(value, 6) for value in calibrated_scores],
+            "remapped_scores": [round(value, 6) for value in remapped_scores],
             "logit_scores": [round(value, 6) for value in logit_scores],
             "final_scores": [round(value, 6) for value in logit_scores],
         }

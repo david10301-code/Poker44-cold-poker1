@@ -120,6 +120,38 @@ def parse_args() -> argparse.Namespace:
             "removed AFTER the holdout split so they affect training only."
         ),
     )
+    parser.add_argument(
+        "--no-miner-visible-payload",
+        action="store_true",
+        help=(
+            "Train on raw benchmark JSON instead of prepare_hand_for_miner() "
+            "sanitized payloads. Not recommended for production miners."
+        ),
+    )
+    parser.add_argument(
+        "--train-latest-days",
+        type=int,
+        default=0,
+        help=(
+            "If >0, keep only the N most recent sourceDate values in the "
+            "training split (after holdout). Use to match live eval recency."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "Fraction of training rows held out for score_remap calibration "
+            "(tuned on validator_reward, not on the test holdout)."
+        ),
+    )
+    parser.add_argument(
+        "--max-validator-fpr",
+        type=float,
+        default=0.09,
+        help="Reject calibration configs with test FPR at or above this value.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument(
@@ -655,12 +687,148 @@ def _conformal_bias_for_target_fpr(
     return float(max(-abs(max_abs_bias), min(abs(max_abs_bias), bias)))
 
 
+def _restrict_train_latest_dates(
+    train_examples: List[Dict[str, Any]],
+    latest_days: int,
+) -> List[Dict[str, Any]]:
+    if latest_days <= 0:
+        return train_examples
+    dates = sorted(
+        {
+            str(example.get("source_date", "")).strip()
+            for example in train_examples
+            if str(example.get("source_date", "")).strip()
+        }
+    )
+    if len(dates) <= latest_days:
+        return train_examples
+    keep = set(dates[-latest_days:])
+    filtered = [
+        example
+        for example in train_examples
+        if str(example.get("source_date", "")).strip() in keep
+    ]
+    if len({int(example["label"]) for example in filtered}) < 2:
+        return train_examples
+    return filtered
+
+
+def _split_fit_calibration(
+    train_examples: List[Dict[str, Any]],
+    *,
+    calibration_fraction: float,
+    seed: int,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    labels = [int(example["label"]) for example in train_examples]
+    if len(train_examples) < 80 or calibration_fraction <= 0 or len(set(labels)) < 2:
+        return train_examples, []
+    fit, calibration = train_test_split(
+        train_examples,
+        test_size=min(max(float(calibration_fraction), 0.05), 0.4),
+        random_state=seed,
+        stratify=labels,
+    )
+    return list(fit), list(calibration)
+
+
+def _apply_score_remap_np(
+    scores: np.ndarray,
+    remap: Dict[str, Any],
+) -> np.ndarray:
+    if not remap or remap.get("kind") != "threshold_logit_v1":
+        return np.clip(scores, 0.0, 1.0)
+    threshold = float(remap.get("threshold", 0.5))
+    temperature = max(float(remap.get("temperature", 0.08)), 1e-6)
+    clipped = np.clip(scores.astype(float), 1e-6, 1.0 - 1e-6)
+    adjusted = (clipped - threshold) / temperature
+    return 1.0 / (1.0 + np.exp(-np.clip(adjusted, -40.0, 40.0)))
+
+
+def _select_score_remap_for_validator_reward(
+    labels: np.ndarray,
+    raw_scores: np.ndarray,
+    *,
+    target_fpr: float,
+    max_validator_fpr: float,
+) -> tuple[Dict[str, Any] | None, Dict[str, float]]:
+    """Pick threshold/temperature on a calibration set to maximize validator_reward."""
+    labels = np.asarray(labels, dtype=int)
+    scores = np.asarray(raw_scores, dtype=float)
+    humans = scores[labels == 0]
+    bots = scores[labels == 1]
+    if humans.size < 8 or bots.size < 8:
+        return None, {}
+
+    thresholds: set[float] = set()
+    for quantile in np.linspace(0.40, 0.995, 24):
+        thresholds.add(float(np.quantile(humans, quantile)))
+    for quantile in np.linspace(0.005, 0.60, 20):
+        thresholds.add(float(np.quantile(bots, quantile)))
+    for anchor in (0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30):
+        thresholds.add(anchor)
+
+    temperatures = [0.03, 0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.50]
+    best_reward = -1.0
+    best_remap: Dict[str, Any] | None = None
+    best_metrics: Dict[str, float] = {}
+
+    for threshold in sorted(thresholds):
+        for temperature in temperatures:
+            remap_candidate = {
+                "kind": "threshold_logit_v1",
+                "threshold": float(threshold),
+                "temperature": float(temperature),
+            }
+            remapped = _apply_score_remap_np(scores, remap_candidate)
+            metrics = _enrich_metrics(labels.tolist(), remapped.tolist())
+            if metrics.get("validator_fpr", 1.0) >= max_validator_fpr - 1e-9:
+                continue
+            if metrics.get("human_prob_max", 1.0) > 0.48:
+                continue
+            reward = float(metrics.get("validator_reward", 0.0))
+            if reward > best_reward:
+                best_reward = reward
+                best_remap = remap_candidate
+                best_metrics = metrics
+
+    if best_remap is None:
+        # Conservative fallback: anchor at human high quantile for target FPR.
+        human_cut = float(np.quantile(humans, 1.0 - max(min(target_fpr, 0.2), 0.01)))
+        bot_cut = float(np.quantile(bots, 0.10))
+        threshold = 0.5 * (human_cut + bot_cut)
+        best_remap = {
+            "kind": "threshold_logit_v1",
+            "threshold": threshold,
+            "temperature": 0.08,
+            "human_cutoff": human_cut,
+            "bot_cutoff": bot_cut,
+            "fallback": True,
+        }
+        remapped = _apply_score_remap_np(scores, best_remap)
+        best_metrics = _enrich_metrics(labels.tolist(), remapped.tolist())
+    else:
+        best_remap["human_cutoff"] = float(
+            np.quantile(humans, 1.0 - max(min(target_fpr, 0.2), 0.01))
+        )
+        best_remap["bot_cutoff"] = float(np.quantile(bots, 0.10))
+        best_remap["fallback"] = False
+
+    best_metrics["calibration_validator_reward"] = float(
+        best_metrics.get("validator_reward", 0.0)
+    )
+    return best_remap, best_metrics
+
+
 # ---------- main training routine ------------------------------------------
 
 
 def train(args: argparse.Namespace) -> Dict[str, Any]:
     benchmark_paths = resolve_benchmark_paths(args.benchmark_path)
-    examples = load_benchmark_examples(benchmark_paths)
+    miner_visible = not bool(args.no_miner_visible_payload)
+    examples = load_benchmark_examples(
+        benchmark_paths,
+        miner_visible=miner_visible,
+    )
     labels_total = Counter(int(example["label"]) for example in examples)
     if len(labels_total) != 2:
         raise RuntimeError(
@@ -674,13 +842,26 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         exclude_train_source_dates=args.exclude_train_source_dates,
         seed=args.seed,
     )
+    train_examples = _restrict_train_latest_dates(
+        train_examples,
+        int(args.train_latest_days),
+    )
+    fit_examples, cal_examples = _split_fit_calibration(
+        train_examples,
+        calibration_fraction=float(args.calibration_fraction),
+        seed=int(args.seed) + 17,
+    )
     print(
         f"Loaded {len(examples)} examples "
         f"({labels_total.get(1, 0)} bot / {labels_total.get(0, 0)} human). "
-        f"Train={len(train_examples)} Test={len(test_examples)} "
+        f"miner_visible_payload={miner_visible} "
+        f"fit={len(fit_examples)} cal={len(cal_examples)} "
+        f"test={len(test_examples)} "
         f"split={split_info['split_strategy']} "
-        f"holdout={split_info.get('holdout_source_dates')}"
+        f"holdout={split_info.get('holdout_source_dates')} "
+        f"excluded_train_dates={split_info.get('excluded_train_source_dates')}"
     )
+    train_examples = fit_examples
 
     feature_names = sorted(examples[0]["features"].keys())
     x_train = _build_matrix(train_examples, feature_names)
@@ -823,65 +1004,72 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         chunk_models=chunk_models,
     )
 
-    # Validator-reward grid search for the post-calibration logit transform.
-    if chunk_models:
-        test_scores = np.asarray(
-            stacked.predict_chunk_scores(
-                [example["chunk"] for example in test_examples],
-                feature_rows=x_test,
-            ),
-            dtype=float,
+    def _stacked_raw_scores(examples: List[Dict[str, Any]]) -> np.ndarray:
+        x_rows = _build_matrix(examples, feature_names)[:, feature_indices]
+        if chunk_models:
+            return np.asarray(
+                stacked.predict_chunk_scores(
+                    [example["chunk"] for example in examples],
+                    feature_rows=x_rows,
+                ),
+                dtype=float,
+            )
+        return stacked.predict_proba(x_rows)[:, 1]
+
+    # Tune score_remap on the calibration split (not the test holdout).
+    score_remap: Dict[str, Any] | None = None
+    cal_metrics: Dict[str, float] = {}
+    if cal_examples:
+        y_cal = np.asarray(
+            [int(example["label"]) for example in cal_examples], dtype=np.int64
+        )
+        cal_raw = _stacked_raw_scores(cal_examples)
+        score_remap, cal_metrics = _select_score_remap_for_validator_reward(
+            y_cal,
+            cal_raw,
+            target_fpr=float(args.target_fpr),
+            max_validator_fpr=float(args.max_validator_fpr),
+        )
+        print(
+            "Calibration score_remap: "
+            f"threshold={score_remap.get('threshold') if score_remap else None} "
+            f"temperature={score_remap.get('temperature') if score_remap else None} "
+            f"cal_reward={cal_metrics.get('calibration_validator_reward', 0.0):.4f} "
+            f"cal_fpr={cal_metrics.get('validator_fpr', 0.0):.4f} "
+            f"cal_recall={cal_metrics.get('validator_bot_recall', 0.0):.4f}"
         )
     else:
-        test_scores = stacked.predict_proba(x_test)[:, 1]
-    bias_grid = _grid(args.score_logit_bias_grid)
-    temp_grid = _grid(args.score_logit_temperature_grid)
+        print("WARN: no calibration split; score_remap disabled.")
 
-    # Conformal candidate added to the bias grid based on test-set humans.
-    human_test_scores = test_scores[y_test == 0]
-    conformal_bias = _conformal_bias_for_target_fpr(
-        human_test_scores, args.target_fpr
+    test_raw = _stacked_raw_scores(test_examples)
+    test_final = (
+        _apply_score_remap_np(test_raw, score_remap)
+        if score_remap
+        else test_raw
     )
-    if all(abs(conformal_bias - candidate) > 1e-3 for candidate in bias_grid):
-        bias_grid.append(conformal_bias)
-
-    # Only humans-near-0.5 are dangerous: a human at score 0.50001 rounds to 1
-    # under validator np.round semantics and instantly spikes FPR. Bots below
-    # 0.5 are just FN, which the validator_reward formula already penalizes
-    # via the recall term. So the margin check is unilateral (humans only).
-    HUMAN_MIN_MARGIN = 0.05
+    raw_humans = test_raw[y_test == 0]
+    raw_bots = test_raw[y_test == 1]
+    raw_separation = (
+        float(np.quantile(raw_bots, 0.10) - np.quantile(raw_humans, 0.90))
+        if raw_humans.size and raw_bots.size
+        else 0.0
+    )
+    test_metrics = _enrich_metrics(y_test.tolist(), test_final.tolist())
     best = {
-        "reward": -1.0,
+        "reward": float(test_metrics.get("validator_reward", 0.0)),
         "bias": 0.0,
         "temperature": 1.0,
-        "metrics": _enrich_metrics(y_test.tolist(), test_scores.tolist()),
+        "metrics": test_metrics,
     }
-    for bias in bias_grid:
-        for temperature in temp_grid:
-            shifted = _logit_shift(test_scores, bias, temperature)
-            metrics = _enrich_metrics(y_test.tolist(), shifted.tolist())
-            if metrics.get("validator_fpr", 1.0) >= 0.10 - 1e-9:
-                metrics["validator_reward"] = 0.0
-            human_clearance = 0.5 - metrics.get("human_prob_max", 1.0)
-            if human_clearance < HUMAN_MIN_MARGIN:
-                metrics["validator_reward"] = (
-                    metrics["validator_reward"] * 0.5
-                    if metrics.get("validator_reward", 0.0) > 0.0
-                    else 0.0
-                )
-            if metrics["validator_reward"] > best["reward"]:
-                best = {
-                    "reward": metrics["validator_reward"],
-                    "bias": bias,
-                    "temperature": temperature,
-                    "metrics": metrics,
-                }
     print(
-        "Selected logit transform: "
-        f"bias={best['bias']:.4f} temperature={best['temperature']:.4f} "
+        "Holdout test (honest, not used for calibration): "
         f"validator_reward={best['reward']:.4f} "
         f"validator_fpr={best['metrics'].get('validator_fpr', 0.0):.4f} "
-        f"pr_auc={best['metrics'].get('pr_auc', 0.0):.4f}"
+        f"validator_bot_recall={best['metrics'].get('validator_bot_recall', 0.0):.4f} "
+        f"pr_auc={best['metrics'].get('pr_auc', 0.0):.4f} "
+        f"raw_separation_q90_q10={raw_separation:.4f} "
+        f"human_prob_max={best['metrics'].get('human_prob_max', 0.0):.4f} "
+        f"bot_prob_min={best['metrics'].get('bot_prob_min', 0.0):.4f}"
     )
 
     framework_models = base_names + chunk_names
@@ -912,10 +1100,19 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         "human_weight_multiplier": float(args.human_weight_multiplier),
         "meta_c": float(args.meta_c),
         "target_fpr": float(args.target_fpr),
-        "score_logit_bias": float(best["bias"]),
-        "score_logit_temperature": float(best["temperature"]),
+        "max_validator_fpr": float(args.max_validator_fpr),
+        "calibration_fraction": float(args.calibration_fraction),
+        "calibration_rows": float(len(cal_examples)),
+        "miner_visible_payload": bool(miner_visible),
+        "train_latest_days": float(args.train_latest_days),
+        "score_remap": dict(score_remap) if score_remap else {},
+        "calibration_metrics": cal_metrics,
+        "holdout_test_metrics": best["metrics"],
+        "raw_separation_q90_q10": float(raw_separation),
+        "score_logit_bias": 0.0,
+        "score_logit_temperature": 1.0,
         "model_weights": [1.0],
-        "ensemble_combiner": "stacking_logreg+isotonic",
+        "ensemble_combiner": "stacking_logreg+isotonic+score_remap",
         **split_info,
     }
 

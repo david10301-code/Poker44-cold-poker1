@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from poker44_ml.features import chunk_features
+from poker44.validator.payload_view import prepare_hand_for_miner
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -42,9 +43,25 @@ def _as_root(payload: Any) -> Any:
     return payload
 
 
-def _feature_row(chunk: list[dict[str, Any]]) -> dict[str, float]:
-    row = chunk_features(chunk)
-    row["hand_count"] = float(len(chunk))
+def miner_visible_chunk(chunk: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Match validator production path: same sanitization miners receive."""
+    return [
+        prepare_hand_for_miner(hand)
+        for hand in chunk
+        if isinstance(hand, dict)
+    ]
+
+
+def _feature_row(
+    chunk: list[dict[str, Any]],
+    *,
+    miner_visible: bool = True,
+) -> dict[str, float]:
+    payload = miner_visible_chunk(chunk) if miner_visible else chunk
+    if not payload:
+        return {"hand_count": 0.0}
+    row = chunk_features(payload)
+    row["hand_count"] = float(len(payload))
     return row
 
 
@@ -55,7 +72,11 @@ def _iter_release_groups(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _load_labeled_benchmark_file(path: Path) -> list[dict[str, Any]]:
+def _load_labeled_benchmark_file(
+    path: Path,
+    *,
+    miner_visible: bool = True,
+) -> list[dict[str, Any]]:
     payload = load_json_or_gz(path)
     root = _as_root(payload)
     groups = _iter_release_groups(payload)
@@ -80,16 +101,21 @@ def _load_labeled_benchmark_file(path: Path) -> list[dict[str, Any]]:
             hand_chunk = [hand for hand in chunk if isinstance(hand, dict)]
             if not hand_chunk:
                 continue
+            visible_chunk = (
+                miner_visible_chunk(hand_chunk) if miner_visible else hand_chunk
+            )
+            if not visible_chunk:
+                continue
             examples.append(
                 {
-                    "chunk": hand_chunk,
+                    "chunk": visible_chunk,
                     "label": int(label),
                     "source_date": source_date,
                     "group_id": group_id,
                     "group_hash": group_hash,
                     "item_index": item_index,
                     "source_path": str(path),
-                    "features": _feature_row(hand_chunk),
+                    "features": _feature_row(visible_chunk, miner_visible=False),
                 }
             )
     if not examples:
@@ -97,12 +123,16 @@ def _load_labeled_benchmark_file(path: Path) -> list[dict[str, Any]]:
     return examples
 
 
-def load_benchmark_examples(paths: str | Path | list[str | Path]) -> list[dict[str, Any]]:
+def load_benchmark_examples(
+    paths: str | Path | list[str | Path],
+    *,
+    miner_visible: bool = True,
+) -> list[dict[str, Any]]:
     path_list = [Path(paths)] if isinstance(paths, (str, Path)) else [Path(p) for p in paths]
     examples: list[dict[str, Any]] = []
     seen: set[str] = set()
     for path in path_list:
-        for example in _load_labeled_benchmark_file(path):
+        for example in _load_labeled_benchmark_file(path, miner_visible=miner_visible):
             key = "|".join(
                 [
                     str(example.get("source_path", "")),
