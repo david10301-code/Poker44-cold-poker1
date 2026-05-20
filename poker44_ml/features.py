@@ -46,6 +46,12 @@ FEATURE_NAMES = (
     "hero_is_button",
     "hero_position_signal",
     "players_to_flop_signal",
+    "preflop_zero_check_share",
+    "same_actor_action_run_share",
+    "pot_decrease_share",
+    "pot_nonmonotonic_share",
+    "pot_mismatch_share",
+    "action_id_nonseq_share",
 )
 
 
@@ -183,6 +189,15 @@ def _hand_feature_values(hand: dict[str, Any]) -> tuple[float, ...]:
     call_to_values_bb: list[float] = []
     pot_before_values: list[float] = []
     pot_after_values: list[float] = []
+    action_ids: list[int] = []
+    preflop_zero_check_count = 0
+    previous_pot_after: float | None = None
+    pot_decrease_count = 0
+    pot_nonmonotonic_count = 0
+    pot_mismatch_count = 0
+    previous_actor_action: tuple[int, str, str] | None = None
+    same_actor_action_run = 0
+    max_same_actor_action_run = 0
     hero_seat = int(metadata.get("hero_seat") or 0)
     button_seat = int(metadata.get("button_seat") or 0)
     max_seats = max(1, int(metadata.get("max_seats") or len(players) or 1))
@@ -199,6 +214,7 @@ def _hand_feature_values(hand: dict[str, Any]) -> tuple[float, ...]:
         later_street_count += int(street_name not in {"", "preflop"})
         amount_bb = safe_float(action.get("normalized_amount_bb"), 0.0)
         amount_values_bb.append(amount_bb)
+        raw_amount = safe_float(action.get("amount"), 0.0)
         raise_to_value = safe_float(action.get("raise_to"), 0.0)
         call_to_value = safe_float(action.get("call_to"), 0.0)
         if bb_value > 0.0:
@@ -206,10 +222,33 @@ def _hand_feature_values(hand: dict[str, Any]) -> tuple[float, ...]:
             call_to_value /= bb_value
         raise_to_values_bb.append(raise_to_value)
         call_to_values_bb.append(call_to_value)
-        pot_before_values.append(safe_float(action.get("pot_before"), 0.0))
-        pot_after_values.append(safe_float(action.get("pot_after"), 0.0))
+        pot_before = safe_float(action.get("pot_before"), 0.0)
+        pot_after = safe_float(action.get("pot_after"), 0.0)
+        pot_before_values.append(pot_before)
+        pot_after_values.append(pot_after)
+        pot_decrease_count += int(pot_after + 1e-9 < pot_before)
+        if previous_pot_after is not None:
+            pot_nonmonotonic_count += int(pot_before + 1e-9 < previous_pot_after)
+        previous_pot_after = pot_after
+        if raw_amount > 0.0:
+            pot_mismatch_count += int(
+                abs((pot_after - pot_before) - raw_amount)
+                > max(1e-6, abs(raw_amount) * 0.05)
+            )
+        try:
+            action_ids.append(int(action.get("action_id")))
+        except (TypeError, ValueError):
+            pass
         if amount_bb <= 0.0:
             zero_amount_count += 1
+            preflop_zero_check_count += int(street_name == "preflop" and action_type == "check")
+        actor_action_key = (action_actor, action_type, street_name)
+        if previous_actor_action == actor_action_key:
+            same_actor_action_run += 1
+        else:
+            same_actor_action_run = 1
+        max_same_actor_action_run = max(max_same_actor_action_run, same_actor_action_run)
+        previous_actor_action = actor_action_key
         if action_type == "call":
             call_count += 1
         elif action_type == "check":
@@ -320,6 +359,15 @@ def _hand_feature_values(hand: dict[str, Any]) -> tuple[float, ...]:
     if hero_seat and button_seat:
         hero_position_signal = ((hero_seat - button_seat) % max_seats) / max(1, max_seats - 1)
     players_to_flop_signal = safe_div(len(streets), max(1.0, player_count))
+    preflop_zero_check_share = safe_div(preflop_zero_check_count, max(preflop_count, 1))
+    same_actor_action_run_share = safe_div(max_same_actor_action_run, total_actions)
+    pot_decrease_share = safe_div(pot_decrease_count, total_actions)
+    pot_nonmonotonic_share = safe_div(pot_nonmonotonic_count, max(total_actions - 1, 1))
+    pot_mismatch_share = safe_div(pot_mismatch_count, total_actions)
+    action_id_nonseq_share = safe_div(
+        sum(1 for prev, curr in zip(action_ids, action_ids[1:]) if curr != prev + 1),
+        max(len(action_ids) - 1, 1),
+    )
 
     return (
         call_ratio,
@@ -361,6 +409,12 @@ def _hand_feature_values(hand: dict[str, Any]) -> tuple[float, ...]:
         hero_is_button,
         hero_position_signal,
         players_to_flop_signal,
+        preflop_zero_check_share,
+        same_actor_action_run_share,
+        pot_decrease_share,
+        pot_nonmonotonic_share,
+        pot_mismatch_share,
+        action_id_nonseq_share,
     )
 
 
@@ -599,6 +653,12 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
         "rake_to_pot_ratio",
         "hero_position_signal",
         "players_to_flop_signal",
+        "preflop_zero_check_share",
+        "same_actor_action_run_share",
+        "pot_decrease_share",
+        "pot_nonmonotonic_share",
+        "pot_mismatch_share",
+        "action_id_nonseq_share",
     }
     for idx, feature_name in enumerate(FEATURE_NAMES):
         if feature_name not in distribution_features:

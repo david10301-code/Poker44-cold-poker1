@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+# Cosmetic noise from LightGBM<->sklearn 1.7 feature-name validation. Numpy
+# rows we pass to predict_proba are correctly aligned by index; the warning
+# only fires because LightGBM 4.x stores a feature signature on fit.
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names",
+    category=UserWarning,
+)
 
 from poker44_ml.features import chunk_features
 
@@ -65,9 +75,29 @@ class Poker44Model:
             rows.append([float(features.get(name, 0.0)) for name in self.feature_names])
         return rows
 
-    def _raw_model_scores(self, rows: list[list[float]]) -> list[float]:
+    def _raw_model_scores(
+        self,
+        rows: list[list[float]],
+        chunks: list[list[dict[str, Any]]] | None = None,
+    ) -> list[float]:
         per_model: list[list[float]] = []
         for model in self.models:
+            if (
+                chunks is not None
+                and hasattr(model, "predict_chunk_scores")
+                and not isinstance(model, type(self))
+            ):
+                try:
+                    raw = model.predict_chunk_scores(chunks, feature_rows=rows)
+                    per_model.append([self._clamp01(float(value)) for value in raw])
+                    continue
+                except TypeError:
+                    try:
+                        raw = model.predict_chunk_scores(chunks)
+                        per_model.append([self._clamp01(float(value)) for value in raw])
+                        continue
+                    except TypeError:
+                        pass
             if hasattr(model, "predict_proba"):
                 probabilities = model.predict_proba(rows)
                 per_model.append([self._clamp01(row[1]) for row in probabilities])
@@ -128,7 +158,7 @@ class Poker44Model:
         if not chunks:
             return []
         rows = self._aligned_rows(chunks)
-        raw_scores = self._raw_model_scores(rows)
+        raw_scores = self._raw_model_scores(rows, chunks=chunks)
         calibrated_scores = self._apply_calibrator(raw_scores)
         logit_scores = self._apply_score_logit(calibrated_scores)
         return [round(self._clamp01(value), 6) for value in logit_scores]
@@ -144,7 +174,7 @@ class Poker44Model:
         if not chunks:
             return {}
         rows = self._aligned_rows(chunks)
-        raw_scores = self._raw_model_scores(rows)
+        raw_scores = self._raw_model_scores(rows, chunks=chunks)
         calibrated_scores = self._apply_calibrator(raw_scores)
         logit_scores = self._apply_score_logit(calibrated_scores)
         return {

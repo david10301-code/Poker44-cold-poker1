@@ -54,6 +54,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default=str(REPO_ROOT / "models" / "poker44_clean_restart.joblib"))
     parser.add_argument("--holdout-latest-days", type=int, default=2)
     parser.add_argument("--holdout-source-dates", type=str, default=None)
+    parser.add_argument(
+        "--exclude-train-source-dates",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated sourceDate values to remove from the training side only. "
+            "Useful for testing whether one date causes negative transfer to a holdout date."
+        ),
+    )
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--calibration-size", type=float, default=0.2)
     parser.add_argument(
@@ -109,6 +118,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-forest-weight", type=float, default=0.25)
     parser.add_argument("--hist-gradient-weight", type=float, default=0.30)
     parser.add_argument(
+        "--bot-sample-weight",
+        type=float,
+        default=1.0,
+        help="Training sample weight multiplier for labeled bot chunks.",
+    )
+    parser.add_argument(
+        "--human-sample-weight",
+        type=float,
+        default=1.0,
+        help="Training sample weight multiplier for labeled human chunks.",
+    )
+    parser.add_argument(
         "--score-logit-bias",
         type=float,
         default=0.0,
@@ -159,6 +180,7 @@ def _split_benchmark(
     examples: list[dict[str, Any]],
     *,
     holdout_source_dates: str | None,
+    exclude_train_source_dates: str | None,
     holdout_latest_days: int,
     test_size: float,
     seed: int,
@@ -171,16 +193,43 @@ def _split_benchmark(
         }
     )
     requested = [item.strip() for item in str(holdout_source_dates or "").split(",") if item.strip()]
+    excluded_train_dates = [
+        item.strip()
+        for item in str(exclude_train_source_dates or "").split(",")
+        if item.strip()
+    ]
+    excluded_train_set = set(excluded_train_dates)
+
+    def apply_train_exclusion(train_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not excluded_train_set:
+            return train_rows
+        return [
+            example
+            for example in train_rows
+            if str(example.get("source_date", "")).strip() not in excluded_train_set
+        ]
+
     holdout_dates = requested or dates[-max(1, int(holdout_latest_days)) :]
     if holdout_dates:
         holdout_set = set(holdout_dates)
         train = [example for example in examples if str(example.get("source_date", "")).strip() not in holdout_set]
         test = [example for example in examples if str(example.get("source_date", "")).strip() in holdout_set]
+        train = apply_train_exclusion(train)
         if train and test and len({int(example["label"]) for example in test}) >= 2:
+            if len({int(example["label"]) for example in train}) < 2:
+                raise RuntimeError(
+                    "Training set must contain both labels after applying "
+                    f"--exclude-train-source-dates={exclude_train_source_dates!r}"
+                )
             return train, test, {
                 "split_strategy": "holdout_source_dates",
                 "holdout_source_dates": holdout_dates,
-                "train_source_dates": [date for date in dates if date not in holdout_set],
+                "excluded_train_source_dates": excluded_train_dates,
+                "train_source_dates": [
+                    date
+                    for date in dates
+                    if date not in holdout_set and date not in excluded_train_set
+                ],
             }
 
     labels = [int(example["label"]) for example in examples]
@@ -190,10 +239,17 @@ def _split_benchmark(
         random_state=seed,
         stratify=labels,
     )
+    train = apply_train_exclusion(train)
+    if len({int(example["label"]) for example in train}) < 2:
+        raise RuntimeError(
+            "Training set must contain both labels after applying "
+            f"--exclude-train-source-dates={exclude_train_source_dates!r}"
+        )
     return train, test, {
         "split_strategy": "random_stratified",
         "holdout_source_dates": [],
-        "train_source_dates": dates,
+        "excluded_train_source_dates": excluded_train_dates,
+        "train_source_dates": [date for date in dates if date not in excluded_train_set],
     }
 
 
@@ -416,6 +472,7 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
     train_examples, test_examples, split_info = _split_benchmark(
         benchmark_examples,
         holdout_source_dates=args.holdout_source_dates,
+        exclude_train_source_dates=args.exclude_train_source_dates,
         holdout_latest_days=args.holdout_latest_days,
         test_size=args.test_size,
         seed=args.seed,
@@ -432,7 +489,15 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
 
     X_fit = _build_matrix(fit_examples, feature_names)
     y_fit = [int(example["label"]) for example in fit_examples]
-    weights = [1.0 for _ in fit_examples]
+    bot_sample_weight = max(0.0, float(args.bot_sample_weight))
+    human_sample_weight = max(0.0, float(args.human_sample_weight))
+    if bot_sample_weight <= 0.0 and human_sample_weight <= 0.0:
+        bot_sample_weight = 1.0
+        human_sample_weight = 1.0
+    weights = [
+        bot_sample_weight if label == 1 else human_sample_weight
+        for label in y_fit
+    ]
 
     X_cal = _build_matrix(calibration_examples, feature_names)
     y_cal = [int(example["label"]) for example in calibration_examples]
@@ -522,6 +587,9 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "benchmark_negative_rows": float(label_counts.get(0, 0)),
         "benchmark_chunk_sizes": ",".join(str(size) for size in benchmark_chunk_sizes),
         "train_rows": float(len(X_fit)),
+        "pre_calibration_train_rows": float(len(train_examples)),
+        "excluded_train_source_dates": split_info.get("excluded_train_source_dates", []),
+        "train_source_dates": split_info.get("train_source_dates", []),
         "calibration_rows": float(len(X_cal)),
         "calibration_method": str(args.calibration_method),
         "calibration_seed": float(
@@ -536,6 +604,8 @@ def train_model(args: argparse.Namespace) -> tuple[list[object], list[str], dict
         "test_rows": float(len(X_test)),
         "score_logit_bias": float(args.score_logit_bias),
         "score_logit_temperature": float(args.score_logit_temperature),
+        "bot_sample_weight": float(bot_sample_weight),
+        "human_sample_weight": float(human_sample_weight),
         "model_weights": model_weights,
         "n_estimators": float(args.n_estimators),
         "max_depth": float(args.max_depth),
@@ -578,6 +648,7 @@ def main() -> None:
         f"framework={metadata.get('framework')} "
         f"split_strategy={metadata.get('split_strategy')} "
         f"holdout_dates={metadata.get('holdout_source_dates')} "
+        f"excluded_train_dates={metadata.get('excluded_train_source_dates')} "
         f"benchmark_rows={metadata.get('benchmark_rows')}"
     )
     calibrator = metadata.get("calibrator")
