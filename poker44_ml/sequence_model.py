@@ -57,16 +57,12 @@ except ImportError as exc:  # pragma: no cover
 
 _ACTION_TYPE_VOCAB: Dict[str, int] = {
     "<pad>": 0,
-    "small_blind": 1,
-    "big_blind": 2,
-    "ante": 3,
-    "check": 4,
-    "call": 5,
-    "bet": 6,
-    "raise": 7,
-    "fold": 8,
-    "all_in": 9,
-    "other": 10,
+    # Miner-visible canonical payload excludes blinds/ante and unknown labels.
+    "check": 1,
+    "call": 2,
+    "bet": 3,
+    "raise": 4,
+    "fold": 5,
 }
 _STREET_VOCAB: Dict[str, int] = {
     "<pad>": 0,
@@ -78,8 +74,7 @@ _STREET_VOCAB: Dict[str, int] = {
 }
 _ACTOR_ROLE_PAD = 0
 _ACTOR_ROLE_HERO = 1
-_ACTOR_ROLE_BUTTON = 2
-_ACTOR_ROLE_OTHER = 3
+_ACTOR_ROLE_OTHER = 2
 
 # Mirrors real competition payload canonicalization which coarsens amounts.
 _AMOUNT_BUCKETS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 56.0, 84.0, 126.0)
@@ -93,8 +88,12 @@ _POT_FLOW_VOCAB = {
 }
 
 
-MAX_ACTIONS_PER_HAND = 16
-MAX_HANDS_PER_CHUNK = 16
+# payload_view canonicalizer keeps <=12 actions (often 5-8). Defaults align to
+# that range, but these are configurable via SequenceModelConfig.
+DEFAULT_MAX_ACTIONS_PER_HAND = 12
+# Validator competition requests often contain ~40-80 hands/chunk. Default 64
+# captures most chunk-level sequence signal without O(N^2) blow-ups.
+DEFAULT_MAX_HANDS_PER_CHUNK = 64
 # Keep only robust numeric channels consistently present in live payloads.
 CONT_DIM = 3  # amount_bb, pot_after_bb, pot_delta_bb
 
@@ -109,7 +108,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _action_type_id(value: Any) -> int:
-    raw = str(value or "other").strip().lower()
+    raw = str(value or "").strip().lower()
     if raw in _ACTION_TYPE_VOCAB:
         return _ACTION_TYPE_VOCAB[raw]
     if "raise" in raw:
@@ -122,7 +121,9 @@ def _action_type_id(value: Any) -> int:
         return _ACTION_TYPE_VOCAB["check"]
     if "fold" in raw or raw == "muck":
         return _ACTION_TYPE_VOCAB["fold"]
-    return _ACTION_TYPE_VOCAB["other"]
+    # payload_view canonicalizer should already emit known labels; for any
+    # leftover/empty value, use the least committal non-pad action token.
+    return _ACTION_TYPE_VOCAB["check"]
 
 
 def _street_id(value: Any) -> int:
@@ -130,13 +131,11 @@ def _street_id(value: Any) -> int:
     return _STREET_VOCAB.get(raw, _STREET_VOCAB[""])
 
 
-def _actor_role(actor_seat: int, hero_seat: int, button_seat: int) -> int:
+def _actor_role(actor_seat: int, hero_seat: int) -> int:
     if actor_seat <= 0:
         return _ACTOR_ROLE_OTHER
     if hero_seat and actor_seat == hero_seat:
         return _ACTOR_ROLE_HERO
-    if button_seat and actor_seat == button_seat:
-        return _ACTOR_ROLE_BUTTON
     return _ACTOR_ROLE_OTHER
 
 
@@ -165,32 +164,51 @@ def _pot_flow_id(pot_before_bb: float, pot_after_bb: float) -> int:
     return _POT_FLOW_VOCAB["large_up"]
 
 
-def encode_hand(hand: Dict[str, Any]) -> Dict[str, np.ndarray]:
+def _sample_hand_indices(total: int, limit: int) -> List[int]:
+    """Keep order while covering the full chunk span."""
+    if total <= limit:
+        return list(range(total))
+    if limit <= 1:
+        return [total // 2]
+    last = total - 1
+    indices = {
+        int(round(i * last / (limit - 1)))
+        for i in range(limit)
+    }
+    while len(indices) < limit:
+        # fill deterministically if rounding collapsed some positions
+        candidate = len(indices) * last // max(limit - 1, 1)
+        indices.add(int(candidate))
+    return sorted(indices)[:limit]
+
+
+def encode_hand(
+    hand: Dict[str, Any],
+    *,
+    max_actions_per_hand: int = DEFAULT_MAX_ACTIONS_PER_HAND,
+) -> Dict[str, np.ndarray]:
     """Convert a single hand payload into padded token tensors."""
     metadata = hand.get("metadata") or {}
     actions = hand.get("actions") or []
     hero_seat = int(metadata.get("hero_seat") or 0)
-    button_seat = int(metadata.get("button_seat") or 0)
     bb = _safe_float(metadata.get("bb"), 0.02) or 0.02
 
-    action_type = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
-    street = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
-    actor_role = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
-    amount_bucket = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
-    pot_flow = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
-    cont = np.zeros((MAX_ACTIONS_PER_HAND, CONT_DIM), dtype=np.float32)
-    mask = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.bool_)
+    action_type = np.zeros(max_actions_per_hand, dtype=np.int64)
+    street = np.zeros(max_actions_per_hand, dtype=np.int64)
+    actor_role = np.zeros(max_actions_per_hand, dtype=np.int64)
+    amount_bucket = np.zeros(max_actions_per_hand, dtype=np.int64)
+    pot_flow = np.zeros(max_actions_per_hand, dtype=np.int64)
+    cont = np.zeros((max_actions_per_hand, CONT_DIM), dtype=np.float32)
+    mask = np.zeros(max_actions_per_hand, dtype=np.bool_)
 
-    n_actions = min(len(actions), MAX_ACTIONS_PER_HAND)
+    n_actions = min(len(actions), max_actions_per_hand)
     for idx in range(n_actions):
         action = actions[idx]
         if not isinstance(action, dict):
             continue
         action_type[idx] = _action_type_id(action.get("action_type"))
         street[idx] = _street_id(action.get("street"))
-        actor_role[idx] = _actor_role(
-            int(action.get("actor_seat") or 0), hero_seat, button_seat
-        )
+        actor_role[idx] = _actor_role(int(action.get("actor_seat") or 0), hero_seat)
         amount_bb = _safe_float(action.get("normalized_amount_bb"), 0.0)
         if amount_bb == 0.0:
             amount_bb = _to_bb(action.get("amount"), bb)
@@ -214,27 +232,32 @@ def encode_hand(hand: Dict[str, Any]) -> Dict[str, np.ndarray]:
     }
 
 
-def encode_chunk(chunk: Sequence[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+def encode_chunk(
+    chunk: Sequence[Dict[str, Any]],
+    *,
+    max_hands_per_chunk: int = DEFAULT_MAX_HANDS_PER_CHUNK,
+    max_actions_per_hand: int = DEFAULT_MAX_ACTIONS_PER_HAND,
+) -> Dict[str, np.ndarray]:
     """Pad a chunk into fixed-size hand x action tensors with masks."""
-    action_type = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
-    street = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
-    actor_role = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
-    amount_bucket = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
-    pot_flow = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
+    action_type = np.zeros((max_hands_per_chunk, max_actions_per_hand), dtype=np.int64)
+    street = np.zeros((max_hands_per_chunk, max_actions_per_hand), dtype=np.int64)
+    actor_role = np.zeros((max_hands_per_chunk, max_actions_per_hand), dtype=np.int64)
+    amount_bucket = np.zeros((max_hands_per_chunk, max_actions_per_hand), dtype=np.int64)
+    pot_flow = np.zeros((max_hands_per_chunk, max_actions_per_hand), dtype=np.int64)
     cont = np.zeros(
-        (MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND, CONT_DIM), dtype=np.float32
+        (max_hands_per_chunk, max_actions_per_hand, CONT_DIM), dtype=np.float32
     )
     action_mask = np.zeros(
-        (MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.bool_
+        (max_hands_per_chunk, max_actions_per_hand), dtype=np.bool_
     )
-    hand_mask = np.zeros(MAX_HANDS_PER_CHUNK, dtype=np.bool_)
+    hand_mask = np.zeros(max_hands_per_chunk, dtype=np.bool_)
 
-    n_hands = min(len(chunk), MAX_HANDS_PER_CHUNK)
-    for hand_idx in range(n_hands):
-        hand = chunk[hand_idx]
+    selected_indices = _sample_hand_indices(len(chunk), max_hands_per_chunk)
+    for hand_idx, source_idx in enumerate(selected_indices):
+        hand = chunk[source_idx]
         if not isinstance(hand, dict):
             continue
-        encoded = encode_hand(hand)
+        encoded = encode_hand(hand, max_actions_per_hand=max_actions_per_hand)
         action_type[hand_idx] = encoded["action_type"]
         street[hand_idx] = encoded["street"]
         actor_role[hand_idx] = encoded["actor_role"]
@@ -265,9 +288,17 @@ class _ChunkDataset(Dataset):
         chunks: Sequence[Sequence[Dict[str, Any]]],
         labels: Optional[Sequence[int]] = None,
         weights: Optional[Sequence[float]] = None,
+        *,
+        max_hands_per_chunk: int = DEFAULT_MAX_HANDS_PER_CHUNK,
+        max_actions_per_hand: int = DEFAULT_MAX_ACTIONS_PER_HAND,
     ) -> None:
         self.encoded: List[Dict[str, np.ndarray]] = [
-            encode_chunk(chunk) for chunk in chunks
+            encode_chunk(
+                chunk,
+                max_hands_per_chunk=max_hands_per_chunk,
+                max_actions_per_hand=max_actions_per_hand,
+            )
+            for chunk in chunks
         ]
         self.labels = (
             np.asarray(labels, dtype=np.float32) if labels is not None else None
@@ -324,6 +355,8 @@ class SequenceModelConfig:
     n_hand_layers: int = 1
     dropout: float = 0.1
     ff_mult: int = 2
+    max_actions_per_hand: int = DEFAULT_MAX_ACTIONS_PER_HAND
+    max_hands_per_chunk: int = DEFAULT_MAX_HANDS_PER_CHUNK
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -333,6 +366,8 @@ class SequenceModelConfig:
             "n_hand_layers": int(self.n_hand_layers),
             "dropout": float(self.dropout),
             "ff_mult": int(self.ff_mult),
+            "max_actions_per_hand": int(self.max_actions_per_hand),
+            "max_hands_per_chunk": int(self.max_hands_per_chunk),
         }
 
 
@@ -384,10 +419,12 @@ class ChunkSetTransformer(nn.Module):
             len(_ACTION_TYPE_VOCAB), d_model, padding_idx=0
         )
         self.street_emb = nn.Embedding(len(_STREET_VOCAB), d_model, padding_idx=0)
-        self.actor_emb = nn.Embedding(4, d_model, padding_idx=_ACTOR_ROLE_PAD)
+        self.actor_emb = nn.Embedding(3, d_model, padding_idx=_ACTOR_ROLE_PAD)
         self.amount_bucket_emb = nn.Embedding(_AMOUNT_BUCKET_VOCAB_SIZE, d_model, padding_idx=0)
         self.pot_flow_emb = nn.Embedding(len(_POT_FLOW_VOCAB), d_model, padding_idx=0)
-        self.action_pos_emb = nn.Embedding(MAX_ACTIONS_PER_HAND, d_model)
+        self.action_pos_emb = nn.Embedding(
+            int(config.max_actions_per_hand), d_model
+        )
         self.cont_proj = nn.Linear(CONT_DIM, d_model)
         self.input_norm = nn.LayerNorm(d_model)
         self.input_dropout = nn.Dropout(config.dropout)
@@ -399,7 +436,7 @@ class ChunkSetTransformer(nn.Module):
             dropout=config.dropout,
             batch_first=True,
             activation="gelu",
-            norm_first=True,
+            norm_first=False,
         )
         self.action_encoder = nn.TransformerEncoder(
             action_layer, num_layers=config.n_action_layers
@@ -413,7 +450,7 @@ class ChunkSetTransformer(nn.Module):
             dropout=config.dropout,
             batch_first=True,
             activation="gelu",
-            norm_first=True,
+            norm_first=False,
         )
         self.hand_encoder = nn.TransformerEncoder(
             hand_layer, num_layers=config.n_hand_layers
@@ -537,8 +574,20 @@ class SequenceModelWrapper:
         val_labels = labels[val_idx]
         val_weights = weights[val_idx]
 
-        train_ds = _ChunkDataset(train_chunks, train_labels, train_weights)
-        val_ds = _ChunkDataset(val_chunks, val_labels, val_weights)
+        train_ds = _ChunkDataset(
+            train_chunks,
+            train_labels,
+            train_weights,
+            max_hands_per_chunk=int(self.config.max_hands_per_chunk),
+            max_actions_per_hand=int(self.config.max_actions_per_hand),
+        )
+        val_ds = _ChunkDataset(
+            val_chunks,
+            val_labels,
+            val_weights,
+            max_hands_per_chunk=int(self.config.max_hands_per_chunk),
+            max_actions_per_hand=int(self.config.max_actions_per_hand),
+        )
 
         train_loader = DataLoader(
             train_ds,
@@ -656,6 +705,8 @@ class SequenceModelWrapper:
             list(chunks),
             np.zeros(len(chunks), dtype=np.float32),
             np.ones(len(chunks), dtype=np.float32),
+            max_hands_per_chunk=int(self.config.max_hands_per_chunk),
+            max_actions_per_hand=int(self.config.max_actions_per_hand),
         )
         loader = DataLoader(ds, batch_size=self.batch_size, shuffle=False, collate_fn=_collate)
         model.eval()

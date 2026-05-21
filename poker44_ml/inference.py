@@ -24,6 +24,9 @@ try:
 except ImportError:  # pragma: no cover
     joblib = None
 
+# Decimal places for miner debug logs (raw / remap / final components).
+SCORE_LOG_DECIMALS = 4
+
 
 class Poker44Model:
     """Small runtime wrapper for the rebuilt supervised Poker44 artifact."""
@@ -150,7 +153,7 @@ class Poker44Model:
             return [self._clamp01(value) for value in scores]
         try:
             threshold = float(self.score_remap.get("threshold", 0.5))
-            temperature = max(float(self.score_remap.get("temperature", 0.08)), 1e-6)
+            temperature = max(float(self.score_remap.get("temperature", 0.25)), 1e-6)
         except (TypeError, ValueError):
             return [self._clamp01(value) for value in scores]
         output: list[float] = []
@@ -187,6 +190,10 @@ class Poker44Model:
         scores = self.predict_chunk_scores([chunk])
         return scores[0] if scores else 0.5
 
+    def _round_score_log_values(self, scores: list[float]) -> list[float]:
+        places = int(SCORE_LOG_DECIMALS)
+        return [round(float(value), places) for value in scores]
+
     def debug_score_components(
         self,
         chunks: list[list[dict[str, Any]]],
@@ -199,10 +206,9 @@ class Poker44Model:
         remapped_scores = self._apply_score_remap(calibrated_scores)
         logit_scores = self._apply_score_logit(remapped_scores)
         return {
-            "raw_scores": [round(value, 6) for value in raw_scores],
-            "calibrated_scores": [round(value, 6) for value in calibrated_scores],
-            "remapped_scores": [round(value, 6) for value in remapped_scores],
-            "final_scores": [round(value, 6) for value in logit_scores],
+            "raw_scores": self._round_score_log_values(raw_scores),
+            "remapped_scores": self._round_score_log_values(remapped_scores),
+            "final_scores": self._round_score_log_values(logit_scores),
         }
 
     def benchmark_latency(

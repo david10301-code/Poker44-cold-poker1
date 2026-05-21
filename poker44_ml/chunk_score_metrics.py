@@ -77,6 +77,24 @@ def enrich_chunk_metrics(
     return metrics
 
 
+def human_bot_prob_bounds(
+    labels: Sequence[int],
+    scores: Sequence[float],
+) -> Dict[str, float]:
+    """Max human / min bot score for a single score band (pre- or post-remap)."""
+    label_list = [int(v) for v in labels]
+    safe = [max(0.0, min(1.0, float(v))) for v in scores]
+    humans = [s for label, s in zip(label_list, safe) if label == 0]
+    bots = [s for label, s in zip(label_list, safe) if label == 1]
+    human_max = float(max(humans)) if humans else 0.0
+    bot_min = float(min(bots)) if bots else 1.0
+    return {
+        "human_prob_max": human_max,
+        "bot_prob_min": bot_min,
+        "score_gap_at_0_5": bot_min - human_max,
+    }
+
+
 def format_chunk_metrics_line(metrics: Dict[str, float]) -> str:
     parts = [
         f"pr_auc={metrics.get('pr_auc', 0.0):.4f}",
@@ -93,8 +111,8 @@ def format_chunk_metrics_line(metrics: Dict[str, float]) -> str:
             [
                 f"raw_min={metrics['raw_prob_min']:.4f}",
                 f"raw_max={metrics['raw_prob_max']:.4f}",
-                f"raw_human_max={metrics.get('raw_human_prob_max', 0.0):.4f}",
-                f"raw_bot_min={metrics.get('raw_bot_prob_min', 0.0):.4f}",
+                f"raw_human_prob_max={metrics.get('raw_human_prob_max', 0.0):.4f}",
+                f"raw_bot_prob_min={metrics.get('raw_bot_prob_min', 0.0):.4f}",
             ]
         )
     return " ".join(parts)

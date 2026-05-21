@@ -25,7 +25,7 @@ cd "$(dirname "$0")/.."
 
 OUTPUT="${OUTPUT:-models/poker44_stacked_robust.joblib}"
 HOLDOUT_SOURCE_DATES="${HOLDOUT_SOURCE_DATES:-2026-05-08}"
-# EXCLUDE_TRAIN_SOURCE_DATES="${EXCLUDE_TRAIN_SOURCE_DATES:-2026-05-07}"
+EXCLUDE_TRAIN_SOURCE_DATES="${EXCLUDE_TRAIN_SOURCE_DATES:-}"
 TARGET_FPR="${TARGET_FPR:-0.04}"
 MAX_VALIDATOR_FPR="${MAX_VALIDATOR_FPR:-0.05}"
 CALIBRATION_OBJECTIVE="${CALIBRATION_OBJECTIVE:-ap_first}"
@@ -39,7 +39,6 @@ MAX_FEATURES="${MAX_FEATURES:-0}"
 CALIBRATION_FRACTION="${CALIBRATION_FRACTION:-0.25}"
 ROBUST_FEATURES_ONLY="${ROBUST_FEATURES_ONLY:-1}"
 NO_SCORE_REMAP="${NO_SCORE_REMAP:-0}"
-LOW_SCORE_REMAP="${LOW_SCORE_REMAP:-0}"
 NO_SCORE_LOGIT_TUNE="${NO_SCORE_LOGIT_TUNE:-1}"
 
 EXTRA_ARGS=()
@@ -72,13 +71,15 @@ if [[ "${ENABLE_GPU_TREES:-0}" == "1" ]]; then
 fi
 if [[ "${ENABLE_SEQUENCE:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--enable-sequence)
-  EXTRA_ARGS+=(--sequence-epochs "${SEQUENCE_EPOCHS:-8}")
+  EXTRA_ARGS+=(--sequence-epochs "${SEQUENCE_EPOCHS:-4}")
   EXTRA_ARGS+=(--sequence-batch-size "${SEQUENCE_BATCH_SIZE:-32}")
   EXTRA_ARGS+=(--sequence-learning-rate "${SEQUENCE_LEARNING_RATE:-1e-3}")
   EXTRA_ARGS+=(--sequence-d-model "${SEQUENCE_D_MODEL:-64}")
   EXTRA_ARGS+=(--sequence-heads "${SEQUENCE_HEADS:-4}")
   EXTRA_ARGS+=(--sequence-action-layers "${SEQUENCE_ACTION_LAYERS:-2}")
   EXTRA_ARGS+=(--sequence-hand-layers "${SEQUENCE_HAND_LAYERS:-1}")
+  EXTRA_ARGS+=(--sequence-max-hands "${SEQUENCE_MAX_HANDS:-64}")
+  EXTRA_ARGS+=(--sequence-max-actions "${SEQUENCE_MAX_ACTIONS:-12}")
   EXTRA_ARGS+=(--sequence-dropout "${SEQUENCE_DROPOUT:-0.1}")
   EXTRA_ARGS+=(--sequence-device "${SEQUENCE_DEVICE:-cuda}")
 fi
@@ -93,11 +94,11 @@ if [[ "$ROBUST_FEATURES_ONLY" == "1" ]]; then
 fi
 if [[ "$NO_SCORE_REMAP" == "1" ]]; then
   EXTRA_ARGS+=(--no-score-remap)
+else
+  EXTRA_ARGS+=(--score-remap-temperature-grid "${SCORE_REMAP_TEMPERATURE_GRID:-0.12,0.18,0.25,0.35,0.50,0.65,0.85,1.0,1.25}")
 fi
-if [[ "$LOW_SCORE_REMAP" == "1" ]]; then
-  EXTRA_ARGS+=(--low-score-remap)
-  EXTRA_ARGS+=(--live-anchor-human "${LIVE_ANCHOR_HUMAN:-0.006}")
-  EXTRA_ARGS+=(--live-anchor-bot "${LIVE_ANCHOR_BOT:-0.012}")
+if [[ "${NO_SCORE_REMAP_PREFER_SMOOTH:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--no-score-remap-prefer-smooth)
 fi
 if [[ "$NO_SCORE_LOGIT_TUNE" == "1" ]]; then
   EXTRA_ARGS+=(--no-score-logit-tune)

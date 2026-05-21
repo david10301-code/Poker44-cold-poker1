@@ -152,10 +152,17 @@ class StackedEnsemble:
         """
         x_arr = np.asarray(feature_rows, dtype=np.float64)
         x_sel = self._select_features(x_arr)
-        feature_probs = self._base_probs(x_sel)
+        if self.base_models:
+            feature_probs = self._base_probs(x_sel)
+        else:
+            feature_probs = np.zeros((len(chunks), 0), dtype=float)
         chunk_probs = self._chunk_probs(list(chunks))
+        if feature_probs.size == 0 and chunk_probs.size == 0:
+            raise RuntimeError("No base or chunk models are available for scoring.")
         if chunk_probs.size == 0:
             stacked = feature_probs
+        elif feature_probs.size == 0:
+            stacked = chunk_probs
         else:
             stacked = np.concatenate([feature_probs, chunk_probs], axis=1)
         p1 = self._meta_to_output(stacked)

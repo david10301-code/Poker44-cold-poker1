@@ -45,7 +45,10 @@ warnings.filterwarnings(
 import numpy as np
 
 from poker44.score.scoring import reward
-from poker44_ml.chunk_score_metrics import print_chunk_score_diagnostics
+from poker44_ml.chunk_score_metrics import (
+    human_bot_prob_bounds,
+    print_chunk_score_diagnostics,
+)
 from poker44_ml.calibration import BlendedQuantileCalibrator
 from poker44_ml.inference import Poker44Model
 from poker44_ml.stacked import StackedEnsemble
@@ -248,24 +251,21 @@ def parse_args() -> argparse.Namespace:
         help="Do not tune the legacy high-band score_remap on the calibration split.",
     )
     parser.add_argument(
-        "--low-score-remap",
-        action="store_true",
+        "--score-remap-temperature-grid",
+        type=str,
+        default="0.12,0.18,0.25,0.35,0.50,0.65,0.85,1.0,1.25",
         help=(
-            "Tune a fine-grained threshold_logit remap for collapsed live raw scores "
-            "(~0.004-0.01). Uses OOF scores affine-mapped to live anchors."
+            "Comma-separated threshold_logit temperatures for score_remap tuning. "
+            "Higher values = duller/smoother remap (less sharp jumps near threshold)."
         ),
     )
     parser.add_argument(
-        "--live-anchor-human",
-        type=float,
-        default=0.006,
-        help="Target median raw score for humans when tuning low-score remap.",
-    )
-    parser.add_argument(
-        "--live-anchor-bot",
-        type=float,
-        default=0.012,
-        help="Target median raw score for bots when tuning low-score remap.",
+        "--no-score-remap-prefer-smooth",
+        action="store_true",
+        help=(
+            "When calibration metrics tie, do not prefer higher remap temperature "
+            "(default prefers smoother/duller remap)."
+        ),
     )
     parser.add_argument(
         "--no-score-logit-tune",
@@ -363,6 +363,18 @@ def parse_args() -> argparse.Namespace:
         "--sequence-hand-layers",
         type=int,
         default=1,
+    )
+    parser.add_argument(
+        "--sequence-max-hands",
+        type=int,
+        default=64,
+        help="Max sampled hands per chunk for the sequence model tokenizer.",
+    )
+    parser.add_argument(
+        "--sequence-max-actions",
+        type=int,
+        default=12,
+        help="Max actions retained per hand for the sequence model tokenizer.",
     )
     parser.add_argument(
         "--sequence-dropout",
@@ -639,6 +651,8 @@ def _make_sequence_model(args: argparse.Namespace) -> Any:
         n_action_layers=int(args.sequence_action_layers),
         n_hand_layers=int(args.sequence_hand_layers),
         dropout=float(args.sequence_dropout),
+        max_hands_per_chunk=max(1, int(args.sequence_max_hands)),
+        max_actions_per_hand=max(1, int(args.sequence_max_actions)),
     )
     return SequenceModelWrapper(
         config=config,
@@ -826,6 +840,24 @@ def _calibration_objective_key(
     return (ap, recall, val_reward)
 
 
+def _is_better_calibration_candidate(
+    key: Tuple[float, float, float],
+    best_key: Tuple[float, float, float],
+    *,
+    temperature: float,
+    best_temperature: float,
+    prefer_smooth_remap: bool,
+) -> bool:
+    if key > best_key:
+        return True
+    if not prefer_smooth_remap:
+        return False
+    # AP (or reward/recall primary) ties: pick duller remap = higher temperature.
+    if abs(key[0] - best_key[0]) <= 1e-4 and temperature > best_temperature + 1e-9:
+        return True
+    return False
+
+
 def _passes_calibration_constraints(
     metrics: Dict[str, float], *, max_validator_fpr: float
 ) -> bool:
@@ -1001,7 +1033,7 @@ def _apply_score_remap_np(
     if not remap or remap.get("kind") != "threshold_logit_v1":
         return np.clip(scores, 0.0, 1.0)
     threshold = float(remap.get("threshold", 0.5))
-    temperature = max(float(remap.get("temperature", 0.08)), 1e-6)
+    temperature = max(float(remap.get("temperature", 0.25)), 1e-6)
     clipped = np.clip(scores.astype(float), 1e-6, 1.0 - 1e-6)
     adjusted = (clipped - threshold) / temperature
     return 1.0 / (1.0 + np.exp(-np.clip(adjusted, -40.0, 40.0)))
@@ -1014,6 +1046,8 @@ def _select_score_remap_for_validator_reward(
     target_fpr: float,
     max_validator_fpr: float,
     calibration_objective: str = "ap_first",
+    temperature_grid: Sequence[float] | None = None,
+    prefer_smooth_remap: bool = True,
 ) -> tuple[Dict[str, Any] | None, Dict[str, float]]:
     """Pick threshold/temperature on a calibration set."""
     labels = np.asarray(labels, dtype=int)
@@ -1031,11 +1065,15 @@ def _select_score_remap_for_validator_reward(
     for anchor in (0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30):
         thresholds.add(anchor)
 
-    temperatures = [0.03, 0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.50]
+    temperatures = sorted(
+        {max(float(t), 1e-6) for t in (temperature_grid or [])}
+        or [0.12, 0.18, 0.25, 0.35, 0.50, 0.65, 0.85, 1.0, 1.25]
+    )
     baseline_metrics = _enrich_metrics(labels.tolist(), scores.tolist())
     best_key = _calibration_objective_key(baseline_metrics, calibration_objective)
     best_remap: Dict[str, Any] | None = None
     best_metrics: Dict[str, float] = dict(baseline_metrics)
+    best_temperature = 0.0
 
     for threshold in sorted(thresholds):
         for temperature in temperatures:
@@ -1051,19 +1089,27 @@ def _select_score_remap_for_validator_reward(
             ):
                 continue
             key = _calibration_objective_key(metrics, calibration_objective)
-            if key > best_key:
+            if _is_better_calibration_candidate(
+                key,
+                best_key,
+                temperature=float(temperature),
+                best_temperature=best_temperature,
+                prefer_smooth_remap=prefer_smooth_remap,
+            ):
                 best_key = key
                 best_remap = remap_candidate
                 best_metrics = metrics
+                best_temperature = float(temperature)
 
     if best_remap is None and calibration_objective != "ap_first":
         human_cut = float(np.quantile(humans, 1.0 - max(min(target_fpr, 0.2), 0.01)))
         bot_cut = float(np.quantile(bots, 0.10))
         threshold = 0.5 * (human_cut + bot_cut)
+        fallback_temp = float(max(temperatures) if temperatures else 0.25)
         best_remap = {
             "kind": "threshold_logit_v1",
             "threshold": threshold,
-            "temperature": 0.08,
+            "temperature": fallback_temp,
             "human_cutoff": human_cut,
             "bot_cutoff": bot_cut,
             "fallback": True,
@@ -1075,114 +1121,6 @@ def _select_score_remap_for_validator_reward(
             np.quantile(humans, 1.0 - max(min(target_fpr, 0.2), 0.01))
         )
         best_remap["bot_cutoff"] = float(np.quantile(bots, 0.10))
-        best_remap["fallback"] = False
-
-    best_metrics["calibration_validator_reward"] = float(
-        best_metrics.get("validator_reward", 0.0)
-    )
-    best_metrics["calibration_objective"] = calibration_objective
-    return best_remap, best_metrics
-
-
-def _scale_scores_to_live_anchor(
-    scores: np.ndarray,
-    labels: np.ndarray,
-    *,
-    human_target: float,
-    bot_target: float,
-) -> np.ndarray:
-    """Affine-map OOF scores to the live raw-score band for remap tuning only."""
-    scores = np.asarray(scores, dtype=float)
-    labels = np.asarray(labels, dtype=int)
-    humans = scores[labels == 0]
-    bots = scores[labels == 1]
-    human_med = float(np.median(humans)) if humans.size else 0.01
-    bot_med = float(np.median(bots)) if bots.size else 0.99
-    human_target = float(human_target)
-    bot_target = float(bot_target)
-    if abs(bot_med - human_med) < 1e-8:
-        scale = human_target / max(human_med, 1e-6)
-        return np.clip(scores * scale, 1e-6, 1.0 - 1e-6)
-    slope = (bot_target - human_target) / (bot_med - human_med)
-    intercept = human_target - slope * human_med
-    return np.clip(slope * scores + intercept, 1e-6, 1.0 - 1e-6)
-
-
-def _select_low_score_remap(
-    labels: np.ndarray,
-    raw_scores: np.ndarray,
-    *,
-    target_fpr: float,
-    max_validator_fpr: float,
-    calibration_objective: str = "ap_first",
-) -> tuple[Dict[str, Any] | None, Dict[str, float]]:
-    """Tune threshold/temperature for collapsed live-like raw scores."""
-    labels = np.asarray(labels, dtype=int)
-    scores = np.asarray(raw_scores, dtype=float)
-    humans = scores[labels == 0]
-    bots = scores[labels == 1]
-    if humans.size < 8 or bots.size < 8:
-        return None, {}
-
-    thresholds: set[float] = set()
-    for quantile in np.linspace(0.20, 0.995, 28):
-        thresholds.add(float(np.quantile(humans, quantile)))
-    for quantile in np.linspace(0.005, 0.80, 24):
-        thresholds.add(float(np.quantile(bots, quantile)))
-    for anchor in np.linspace(0.003, 0.020, 18):
-        thresholds.add(float(anchor))
-
-    temperatures = [
-        0.001,
-        0.0015,
-        0.002,
-        0.003,
-        0.004,
-        0.005,
-        0.008,
-        0.01,
-        0.015,
-        0.02,
-        0.03,
-    ]
-    baseline_metrics = _enrich_metrics(labels.tolist(), scores.tolist())
-    best_key = _calibration_objective_key(baseline_metrics, calibration_objective)
-    best_remap: Dict[str, Any] | None = None
-    best_metrics: Dict[str, float] = dict(baseline_metrics)
-
-    for threshold in sorted(thresholds):
-        for temperature in temperatures:
-            remap_candidate = {
-                "kind": "threshold_logit_v1",
-                "mode": "low_score",
-                "threshold": float(threshold),
-                "temperature": float(temperature),
-            }
-            remapped = _apply_score_remap_np(scores, remap_candidate)
-            metrics = _enrich_metrics(labels.tolist(), remapped.tolist())
-            if not _passes_calibration_constraints(
-                metrics, max_validator_fpr=max_validator_fpr
-            ):
-                continue
-            key = _calibration_objective_key(metrics, calibration_objective)
-            if key > best_key:
-                best_key = key
-                best_remap = remap_candidate
-                best_metrics = metrics
-
-    if best_remap is None and calibration_objective != "ap_first":
-        human_cut = float(np.quantile(humans, 1.0 - max(min(target_fpr, 0.2), 0.01)))
-        bot_cut = float(np.quantile(bots, 0.10))
-        best_remap = {
-            "kind": "threshold_logit_v1",
-            "mode": "low_score",
-            "threshold": 0.5 * (human_cut + bot_cut),
-            "temperature": 0.002,
-            "fallback": True,
-        }
-        remapped = _apply_score_remap_np(scores, best_remap)
-        best_metrics = _enrich_metrics(labels.tolist(), remapped.tolist())
-    elif best_remap is not None:
         best_remap["fallback"] = False
 
     best_metrics["calibration_validator_reward"] = float(
@@ -1391,9 +1329,12 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         )
     oof_ap = float(average_precision_score(y_train, stacked_oof))
     print(f"Stacked OOF AP={oof_ap:.4f} (mean-fold {np.mean(fold_aps):.4f})")
+    oof_raw_bounds = human_bot_prob_bounds(y_train.tolist(), stacked_oof.tolist())
     print(
         "Stacked OOF score range: "
-        f"raw=[{float(np.min(stacked_oof)):.4f}, {float(np.max(stacked_oof)):.4f}]"
+        f"raw=[{float(np.min(stacked_oof)):.4f}, {float(np.max(stacked_oof)):.4f}] "
+        f"raw_human_prob_max={oof_raw_bounds['human_prob_max']:.4f} "
+        f"raw_bot_prob_min={oof_raw_bounds['bot_prob_min']:.4f}"
     )
 
     # Calibration on OOF stacked scores.
@@ -1425,9 +1366,12 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         )
     else:
         raise RuntimeError(f"Unknown stack calibrator mode: {calibrator_mode}")
+    oof_cal_bounds = human_bot_prob_bounds(y_train.tolist(), calibrated_oof.tolist())
     print(
         "Stacked OOF calibrated range: "
-        f"[{float(np.min(calibrated_oof)):.4f}, {float(np.max(calibrated_oof)):.4f}]"
+        f"[{float(np.min(calibrated_oof)):.4f}, {float(np.max(calibrated_oof)):.4f}] "
+        f"human_prob_max={oof_cal_bounds['human_prob_max']:.4f} "
+        f"bot_prob_min={oof_cal_bounds['bot_prob_min']:.4f}"
     )
 
     # Refit base models on the full training set.
@@ -1482,10 +1426,10 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
 
     cal_objective = str(args.calibration_objective)
     use_score_remap = not bool(args.no_score_remap)
-    use_low_score_remap = bool(args.low_score_remap)
+    prefer_smooth_remap = not bool(args.no_score_remap_prefer_smooth)
+    score_remap_temp_grid = _grid(args.score_remap_temperature_grid)
     score_remap: Dict[str, Any] | None = None
     cal_metrics: Dict[str, float] = {}
-    low_remap_metrics: Dict[str, float] = {}
     if use_score_remap and cal_examples:
         y_cal = np.asarray(
             [int(example["label"]) for example in cal_examples], dtype=np.int64
@@ -1497,13 +1441,31 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             target_fpr=float(args.target_fpr),
             max_validator_fpr=float(args.max_validator_fpr),
             calibration_objective=cal_objective,
+            temperature_grid=score_remap_temp_grid,
+            prefer_smooth_remap=prefer_smooth_remap,
         )
+        cal_raw_bounds = human_bot_prob_bounds(y_cal.tolist(), cal_raw.tolist())
+        cal_remap_line = ""
+        if score_remap:
+            cal_remapped = _apply_score_remap_np(cal_raw, score_remap)
+            cal_remap_bounds = human_bot_prob_bounds(
+                y_cal.tolist(), cal_remapped.tolist()
+            )
+            cal_remap_line = (
+                f" remap_range=[{float(np.min(cal_remapped)):.4f}, "
+                f"{float(np.max(cal_remapped)):.4f}]"
+                f" remap_human_prob_max={cal_remap_bounds['human_prob_max']:.4f}"
+                f" remap_bot_prob_min={cal_remap_bounds['bot_prob_min']:.4f}"
+            )
         print(
             "Calibration score_remap: "
             f"objective={cal_objective} "
             f"threshold={score_remap.get('threshold') if score_remap else None} "
             f"temperature={score_remap.get('temperature') if score_remap else None} "
             f"cal_raw_range=[{float(np.min(cal_raw)):.4f}, {float(np.max(cal_raw)):.4f}] "
+            f"raw_human_prob_max={cal_raw_bounds['human_prob_max']:.4f} "
+            f"raw_bot_prob_min={cal_raw_bounds['bot_prob_min']:.4f}"
+            f"{cal_remap_line} "
             f"cal_ap={cal_metrics.get('pr_auc', 0.0):.4f} "
             f"cal_reward={cal_metrics.get('calibration_validator_reward', 0.0):.4f} "
             f"cal_fpr={cal_metrics.get('validator_fpr', 0.0):.4f} "
@@ -1511,39 +1473,10 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         )
     elif use_score_remap:
         print("WARN: no calibration split; score_remap disabled.")
-    elif not use_low_score_remap:
+    else:
         print("score_remap disabled (--no-score-remap).")
 
     oof_for_logit = calibrated_oof
-    if use_low_score_remap:
-        oof_live_band = _scale_scores_to_live_anchor(
-            calibrated_oof,
-            y_train,
-            human_target=float(args.live_anchor_human),
-            bot_target=float(args.live_anchor_bot),
-        )
-        score_remap, low_remap_metrics = _select_low_score_remap(
-            y_train,
-            oof_live_band,
-            target_fpr=float(args.target_fpr),
-            max_validator_fpr=float(args.max_validator_fpr),
-            calibration_objective=cal_objective,
-        )
-        oof_for_logit = (
-            _apply_score_remap_np(calibrated_oof, score_remap)
-            if score_remap
-            else calibrated_oof
-        )
-        print(
-            "Low-score score_remap (OOF live-band): "
-            f"objective={cal_objective} "
-            f"threshold={score_remap.get('threshold') if score_remap else None} "
-            f"temperature={score_remap.get('temperature') if score_remap else None} "
-            f"oof_ap={low_remap_metrics.get('pr_auc', 0.0):.4f} "
-            f"oof_reward={low_remap_metrics.get('calibration_validator_reward', 0.0):.4f} "
-            f"oof_recall={low_remap_metrics.get('validator_bot_recall', 0.0):.4f} "
-            f"oof_fpr={low_remap_metrics.get('validator_fpr', 0.0):.4f}"
-        )
 
     score_logit_bias = 0.0
     score_logit_temperature = 1.0
@@ -1574,7 +1507,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
 
     test_raw = _stacked_raw_scores(test_examples)
     test_mid = test_raw
-    if score_remap and (use_score_remap or use_low_score_remap):
+    if score_remap and use_score_remap:
         test_mid = _apply_score_remap_np(test_raw, score_remap)
     test_final = _logit_shift(
         test_mid, score_logit_bias, score_logit_temperature
@@ -1586,15 +1519,26 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         if raw_humans.size and raw_bots.size
         else 0.0
     )
-    raw_human_max = float(np.max(raw_humans)) if raw_humans.size else 0.0
-    raw_bot_min = float(np.min(raw_bots)) if raw_bots.size else 1.0
-    test_metrics = _enrich_metrics(y_test.tolist(), test_final.tolist())
+    test_metrics = _enrich_metrics(
+        y_test.tolist(),
+        test_final.tolist(),
+        raw_scores=test_raw.tolist(),
+    )
+    remap_bounds: Dict[str, float] = {}
+    if score_remap and use_score_remap:
+        remap_bounds = human_bot_prob_bounds(y_test.tolist(), test_mid.tolist())
     best = {
         "reward": float(test_metrics.get("validator_reward", 0.0)),
         "bias": float(score_logit_bias),
         "temperature": float(score_logit_temperature),
         "metrics": test_metrics,
     }
+    holdout_remap_line = ""
+    if remap_bounds:
+        holdout_remap_line = (
+            f" remap_human_prob_max={remap_bounds['human_prob_max']:.4f}"
+            f" remap_bot_prob_min={remap_bounds['bot_prob_min']:.4f}"
+        )
     print(
         "Holdout test (honest, not used for calibration): "
         f"pr_auc={best['metrics'].get('pr_auc', 0.0):.4f} "
@@ -1602,8 +1546,9 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         f"validator_fpr={best['metrics'].get('validator_fpr', 0.0):.4f} "
         f"validator_bot_recall={best['metrics'].get('validator_bot_recall', 0.0):.4f} "
         f"raw_range=[{float(np.min(test_raw)):.4f}, {float(np.max(test_raw)):.4f}] "
-        f"raw_human_max={raw_human_max:.4f} "
-        f"raw_bot_min={raw_bot_min:.4f} "
+        f"raw_human_prob_max={best['metrics'].get('raw_human_prob_max', 0.0):.4f} "
+        f"raw_bot_prob_min={best['metrics'].get('raw_bot_prob_min', 1.0):.4f}"
+        f"{holdout_remap_line} "
         f"post_remap_range=[{float(np.min(test_mid)):.4f}, {float(np.max(test_mid)):.4f}] "
         f"final_range=[{float(np.min(test_final)):.4f}, {float(np.max(test_final)):.4f}] "
         f"raw_separation_q90_q10={raw_separation:.4f} "
@@ -1654,25 +1599,18 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             len(feature_names) if args.robust_features_only else 0
         ),
         "no_score_remap": bool(args.no_score_remap),
-        "low_score_remap": bool(use_low_score_remap),
-        "live_anchor_human": float(args.live_anchor_human),
-        "live_anchor_bot": float(args.live_anchor_bot),
         "no_score_logit_tune": bool(args.no_score_logit_tune),
         "score_remap": dict(score_remap) if score_remap else {},
-        "calibration_metrics": {**cal_metrics, **low_remap_metrics, **logit_cal_metrics},
+        "calibration_metrics": {**cal_metrics, **logit_cal_metrics},
         "holdout_test_metrics": best["metrics"],
         "raw_separation_q90_q10": float(raw_separation),
         "score_logit_bias": float(score_logit_bias),
         "score_logit_temperature": float(score_logit_temperature),
         "model_weights": [1.0],
         "ensemble_combiner": (
-            f"stacking_logreg+{calibrator_mode}+low_score_remap+score_logit"
-            if (use_low_score_remap and score_remap)
-            else (
-                f"stacking_logreg+{calibrator_mode}+score_remap+score_logit"
-                if (use_score_remap and score_remap)
-                else f"stacking_logreg+{calibrator_mode}+score_logit"
-            )
+            f"stacking_logreg+{calibrator_mode}+score_remap+score_logit"
+            if (use_score_remap and score_remap)
+            else f"stacking_logreg+{calibrator_mode}+score_logit"
         ),
         **split_info,
     }
@@ -1693,10 +1631,14 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
 
     # Sanity round-trip: load via the canonical inference path and rescore.
     loaded = Poker44Model(output_path)
-    rt_scores = loaded.predict_chunk_scores(
-        [example["chunk"] for example in test_examples]
+    test_chunks = [example["chunk"] for example in test_examples]
+    rt_scores = loaded.predict_chunk_scores(test_chunks)
+    rt_debug = loaded.debug_score_components(test_chunks)
+    rt_metrics = _enrich_metrics(
+        y_test.tolist(),
+        rt_scores,
+        raw_scores=rt_debug.get("raw_scores"),
     )
-    rt_metrics = _enrich_metrics(y_test.tolist(), rt_scores)
     rt_metrics["latency_per_chunk_ms"] = loaded.benchmark_latency(
         [example["chunk"] for example in test_examples[:4]]
     )["latency_per_chunk_ms"]
@@ -1718,6 +1660,9 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         "human_prob_max",
         "bot_prob_min",
         "score_gap_at_0_5",
+        "raw_human_prob_max",
+        "raw_bot_prob_min",
+        "raw_score_gap_at_0_5",
         "latency_per_chunk_ms",
     ):
         if key in rt_metrics:

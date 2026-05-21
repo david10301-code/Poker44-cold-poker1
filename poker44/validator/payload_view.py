@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 _LEAKAGE_KEYS = {
     "label",
@@ -201,6 +201,7 @@ def _sample_visible_indices(
         return hashlib.sha256(seed + f":{index}:{extra}".encode("utf-8")).digest()
 
     picked = {0, total - 1}
+
     if actions:
         street_buckets: Dict[str, List[int]] = {}
         for idx in range(1, total - 1):
@@ -215,7 +216,8 @@ def _sample_visible_indices(
                 picked.add(ordered[0])
 
     middle = [idx for idx in range(1, total - 1) if idx not in picked]
-    for idx in sorted(middle, key=_sort_key):
+    ordered_middle = sorted(middle, key=_sort_key)
+    for idx in ordered_middle:
         if len(picked) >= window_size:
             break
         picked.add(idx)
@@ -239,7 +241,8 @@ def _collapse_visible_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, A
             and int(previous.get("actor_seat", 0) or 0) == int(action.get("actor_seat", 0) or 0)
             and str(previous.get("street", "")) == str(action.get("street", ""))
             and float(previous.get("normalized_amount_bb", 0.0) or 0.0) <= 0.0
-            and float(previous.get("pot_after", 0.0) or 0.0) <= float(previous.get("pot_before", 0.0) or 0.0)
+            and float(previous.get("pot_after", 0.0) or 0.0)
+            <= float(previous.get("pot_before", 0.0) or 0.0)
         )
         if duplicate_noop:
             continue
@@ -249,6 +252,7 @@ def _collapse_visible_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, A
 
 
 def build_miner_payload_hand(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep behaviorally useful structure while suppressing direct identity fields."""
     cleaned = strip_private_fields(hand_payload)
     if not isinstance(cleaned, dict):
         return {}
@@ -256,8 +260,12 @@ def build_miner_payload_hand(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
     metadata = cleaned.get("metadata") if isinstance(cleaned.get("metadata"), dict) else {}
     players_raw = cleaned.get("players") if isinstance(cleaned.get("players"), list) else []
     actions_raw = cleaned.get("actions") if isinstance(cleaned.get("actions"), list) else []
+    outcome = cleaned.get("outcome") if isinstance(cleaned.get("outcome"), dict) else {}
 
-    max_seats = max(_DEFAULT_MAX_SEATS, _sanitize_seat(metadata.get("max_seats"), max_seats=10))
+    max_seats = max(
+        _DEFAULT_MAX_SEATS,
+        _sanitize_seat(metadata.get("max_seats"), max_seats=10),
+    )
     source_bb = float(metadata.get("bb", 0.0) or 0.0)
     seat_alias_map = _build_seat_alias_map(players_raw, actions_raw, max_seats=max_seats)
     alias_max_seats = max(2, len(seat_alias_map))
@@ -270,7 +278,9 @@ def build_miner_payload_hand(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
         if seat_i == 0:
             continue
         seat_to_stack_bb[seat_alias_map.get(seat_i, seat_i)] = _to_bb_units(
-            player.get("starting_stack", 0.0), source_bb, upper=_MAX_NORMALIZED_STACK_BB
+            player.get("starting_stack", 0.0),
+            source_bb,
+            upper=_MAX_NORMALIZED_STACK_BB,
         )
 
     visible_players: List[Dict[str, Any]] = [
@@ -288,11 +298,31 @@ def build_miner_payload_hand(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
     for action in actions_raw:
         if not isinstance(action, dict):
             continue
-        amount_bb_raw = _to_bb_units(action.get("amount", 0.0), source_bb, upper=_MAX_NORMALIZED_ACTION_BB)
-        raise_to_bb_raw = _to_bb_units(action.get("raise_to"), source_bb, upper=_MAX_NORMALIZED_POT_BB)
-        call_to_bb_raw = _to_bb_units(action.get("call_to"), source_bb, upper=_MAX_NORMALIZED_POT_BB)
-        pot_before_bb_raw = _to_bb_units(action.get("pot_before", 0.0), source_bb, upper=_MAX_NORMALIZED_POT_BB)
-        pot_after_bb_raw = _to_bb_units(action.get("pot_after", 0.0), source_bb, upper=_MAX_NORMALIZED_POT_BB)
+        amount_bb_raw = _to_bb_units(
+            action.get("amount", 0.0),
+            source_bb,
+            upper=_MAX_NORMALIZED_ACTION_BB,
+        )
+        raise_to_bb_raw = _to_bb_units(
+            action.get("raise_to"),
+            source_bb,
+            upper=_MAX_NORMALIZED_POT_BB,
+        )
+        call_to_bb_raw = _to_bb_units(
+            action.get("call_to"),
+            source_bb,
+            upper=_MAX_NORMALIZED_POT_BB,
+        )
+        pot_before_bb_raw = _to_bb_units(
+            action.get("pot_before", 0.0),
+            source_bb,
+            upper=_MAX_NORMALIZED_POT_BB,
+        )
+        pot_after_bb_raw = _to_bb_units(
+            action.get("pot_after", 0.0),
+            source_bb,
+            upper=_MAX_NORMALIZED_POT_BB,
+        )
         seed_base = [
             str(metadata.get("hero_seat", "")),
             str(metadata.get("max_seats", "")),
@@ -303,8 +333,14 @@ def build_miner_payload_hand(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
         amount_bb = _coarse_bb_value(amount_bb_raw, seed_parts=[*seed_base, "amount"])
         raise_to_bb = _coarse_bb_value(raise_to_bb_raw, seed_parts=[*seed_base, "raise_to"])
         call_to_bb = _coarse_bb_value(call_to_bb_raw, seed_parts=[*seed_base, "call_to"])
-        pot_before_bb = _coarse_bb_value(pot_before_bb_raw, seed_parts=[*seed_base, "pot_before"])
-        pot_after_bb = _coarse_bb_value(max(pot_before_bb, pot_after_bb_raw), seed_parts=[*seed_base, "pot_after"])
+        pot_before_bb = _coarse_bb_value(
+            pot_before_bb_raw,
+            seed_parts=[*seed_base, "pot_before"],
+        )
+        pot_after_bb = _coarse_bb_value(
+            max(pot_before_bb, pot_after_bb_raw),
+            seed_parts=[*seed_base, "pot_after"],
+        )
         direct_action_type = _sanitize_action_type(action.get("action_type"))
         action_type = direct_action_type or _resolve_action_type(
             action.get("action_type"),
@@ -318,14 +354,22 @@ def build_miner_payload_hand(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if direct_action_type == "" and (
             not action_type
-            or (amount_bb <= 0 and raise_to_bb <= 0 and call_to_bb <= 0 and pot_after_bb <= pot_before_bb)
+            or (
+                amount_bb <= 0
+                and raise_to_bb <= 0
+                and call_to_bb <= 0
+                and pot_after_bb <= pot_before_bb
+            )
         ):
             continue
         raw_actions.append(
             {
                 "action_id": "",
                 "street": str(action.get("street", "")),
-                "actor_seat": seat_alias_map.get(_sanitize_seat(action.get("actor_seat"), max_seats=max_seats), 0),
+                "actor_seat": seat_alias_map.get(
+                    _sanitize_seat(action.get("actor_seat"), max_seats=max_seats),
+                    0,
+                ),
                 "action_type": action_type,
                 "amount": _from_bb_units(amount_bb),
                 "raise_to": None if raise_to_bb <= 0 else _from_bb_units(raise_to_bb),
@@ -339,8 +383,10 @@ def build_miner_payload_hand(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
     visible_actions: List[Dict[str, Any]] = []
     raw_actions = _collapse_visible_actions(raw_actions)
     if raw_actions:
+        last_idx = len(raw_actions) - 1
         if len(raw_actions) == 1:
-            indices = [0] * _MINER_ACTION_WINDOW
+            window_size = _MINER_ACTION_WINDOW
+            indices = [0] * window_size
         else:
             window_size = min(
                 len(raw_actions),
@@ -374,7 +420,10 @@ def build_miner_payload_hand(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
             "game_type": str(metadata.get("game_type", "")),
             "limit_type": str(metadata.get("limit_type", "")),
             "max_seats": alias_max_seats,
-            "hero_seat": seat_alias_map.get(_sanitize_seat(metadata.get("hero_seat"), max_seats=max_seats), 0),
+            "hero_seat": seat_alias_map.get(
+                _sanitize_seat(metadata.get("hero_seat"), max_seats=max_seats),
+                0,
+            ),
             "hand_ended_on_street": "",
             "button_seat": 0,
             "sb": _VISIBLE_SB,
@@ -384,7 +433,10 @@ def build_miner_payload_hand(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
         },
         "players": visible_players,
         "streets": [
-            {"street": str(street.get("street", "")), "board_cards": []}
+            {
+                "street": str(street.get("street", "")),
+                "board_cards": [],
+            }
             for street in (cleaned.get("streets") or [])
             if isinstance(street, dict)
         ],
@@ -408,6 +460,7 @@ def prepare_hand_for_miner(hand_payload: Dict[str, Any]) -> Dict[str, Any]:
 def payload_chunk_signature(
     hands: List[Dict[str, Any]],
 ) -> Tuple[float, float, float, float, float, float, float, float, float]:
+    """Coarse miner-visible behavior signature for chunk analysis and matching."""
     if not hands:
         return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 

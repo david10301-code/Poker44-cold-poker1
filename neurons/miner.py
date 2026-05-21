@@ -487,17 +487,30 @@ class Miner(BaseMinerNeuron):
         synapse.predictions = [score >= 0.5 for score in scores]
         synapse.model_manifest = dict(self.model_manifest)
 
+        bot_count = sum(1 for prediction in synapse.predictions if prediction)
+        human_count = len(scores) - bot_count
+        score_log_decimals = 4
+
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         total_hands = sum(chunk_sizes)
         per_chunk_ms = elapsed_ms / max(len(chunks), 1)
         per_hand_ms = elapsed_ms / max(total_hands, 1)
+        score_range = (
+            [
+                round(min(scores), score_log_decimals),
+                round(max(scores), score_log_decimals),
+            ]
+            if scores
+            else [0.0, 0.0]
+        )
         message = (
             f"Scored {len(chunks)} chunks with backend={backend_used} "
             f"elapsed_ms={elapsed_ms:.2f} "
             f"per_chunk_ms={per_chunk_ms:.2f} "
             f"per_hand_ms={per_hand_ms:.2f} "
             f"chunk_size_range={ [min(chunk_sizes), max(chunk_sizes)] if chunk_sizes else [0, 0] } "
-            f"score_range={ [min(scores), max(scores)] if scores else [0.0, 0.0] }"
+            f"bot_count={bot_count} human_count={human_count} "
+            f"score_range={score_range}"
         )
         if self.query_log_preview:
             message += (
@@ -506,19 +519,28 @@ class Miner(BaseMinerNeuron):
             )
         if component_debug:
             for name, values in component_debug.items():
-                if values:
-                    message += f" {name}_range={[min(values), max(values)]}"
+                if name == "calibrated_scores" or not values:
+                    continue
+                message += (
+                    f" {name}_range="
+                    f"{[round(min(values), score_log_decimals), round(max(values), score_log_decimals)]}"
+                )
         bt.logging.info(message)
         if self.score_array_logging:
             score_payload = {
                 "chunk_sizes": chunk_sizes,
-                "risk_scores": [round(float(score), 6) for score in scores],
+                "bot_count": bot_count,
+                "human_count": human_count,
+                "risk_scores": [
+                    round(float(score), score_log_decimals) for score in scores
+                ],
                 "predictions": [bool(prediction) for prediction in synapse.predictions],
             }
             if component_debug:
                 score_payload["components"] = {
-                    name: [round(float(value), 6) for value in values]
+                    name: [round(float(value), score_log_decimals) for value in values]
                     for name, values in component_debug.items()
+                    if name != "calibrated_scores"
                 }
             bt.logging.info(f"Detailed chunk scores | {score_payload}")
         bt.logging.success(

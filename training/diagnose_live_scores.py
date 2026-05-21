@@ -73,33 +73,40 @@ def _diagnose(record: Dict[str, Any], index: int) -> None:
     preds = list(record.get("predictions") or [])
     components = record.get("components") or {}
     raw = list(components.get("raw_scores") or [])
-    calibrated = list(components.get("calibrated_scores") or [])
     remapped = list(components.get("remapped_scores") or [])
-    logits = list(components.get("logit_scores") or [])
+    final_components = list(
+        components.get("final_scores") or components.get("logit_scores") or []
+    )
 
-    print(f"=== Record #{index} | {len(risk)} chunks | hand_size_range="
-          f"[{min(chunk_sizes) if chunk_sizes else '-'},"
-          f"{max(chunk_sizes) if chunk_sizes else '-'}] ===")
+    bot_count = sum(1 for p in preds if p)
+    human_count = max(len(preds) - bot_count, 0)
+    print(
+        f"=== Record #{index} | {len(risk)} chunks | "
+        f"bot_count={bot_count} human_count={human_count} | hand_size_range="
+        f"[{min(chunk_sizes) if chunk_sizes else '-'},"
+        f"{max(chunk_sizes) if chunk_sizes else '-'}] ==="
+    )
     if raw:
         print(_summarize("raw         ", raw))
-    if calibrated and calibrated != raw:
-        print(_summarize("calibrated  ", calibrated))
-    if remapped and remapped != calibrated:
+    if remapped and remapped != raw:
         print(_summarize("score_remap ", remapped))
-    elif logits and logits != calibrated and logits != remapped:
-        print(_summarize("logit_shift ", logits))
+    if final_components and final_components != remapped and final_components != raw:
+        print(_summarize("final_comp  ", final_components))
     if risk:
-        print(_summarize("final       ", risk))
+        print(_summarize("risk_out    ", risk))
 
-    bot_rate = sum(1 for p in preds if p) / max(len(preds), 1)
+    bot_rate = bot_count / max(len(preds), 1)
     above_05 = sum(1 for s in risk if s >= 0.5) / max(len(risk), 1)
-    print(f"predicted bot rate: {bot_rate:.2%}  "
-          f"final>=0.5 rate: {above_05:.2%}")
+    print(
+        f"predicted bot rate: {bot_rate:.2%}  "
+        f"final>=0.5 rate: {above_05:.2%}  "
+        f"bot_count={bot_count} human_count={human_count}"
+    )
 
     flags: List[str] = []
     if raw:
         raw_arr = np.asarray(raw, dtype=float)
-        post_raw = remapped or logits or calibrated or risk
+        post_raw = remapped or final_components or risk
         if float(raw_arr.std()) < 0.02 and bot_rate > 0.6:
             flags.append(
                 "CRITICAL: raw scores have ~no spread but final says "
