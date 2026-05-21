@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Train the v2 stacked Poker44 model for live validator reward.
 #
-# Default: robust feature allowlist + no score_remap (generalization-focused).
+# Default: AP-first calibration (ranking quality), quantile stack calibrator
+# for wider score support, score_remap enabled, and no post-remap logit shift.
+# Leaderboard pattern: high AP + low recall + FPR << 10% -> reward ~0.55-0.60.
 #
 # Usage:
 #   ./scripts/train_stacked_v2.sh
@@ -23,9 +25,12 @@ cd "$(dirname "$0")/.."
 
 OUTPUT="${OUTPUT:-models/poker44_stacked_robust.joblib}"
 HOLDOUT_SOURCE_DATES="${HOLDOUT_SOURCE_DATES:-2026-05-08}"
-EXCLUDE_TRAIN_SOURCE_DATES="${EXCLUDE_TRAIN_SOURCE_DATES:-2026-05-07}"
+# EXCLUDE_TRAIN_SOURCE_DATES="${EXCLUDE_TRAIN_SOURCE_DATES:-2026-05-07}"
 TARGET_FPR="${TARGET_FPR:-0.04}"
-MAX_VALIDATOR_FPR="${MAX_VALIDATOR_FPR:-0.09}"
+MAX_VALIDATOR_FPR="${MAX_VALIDATOR_FPR:-0.05}"
+CALIBRATION_OBJECTIVE="${CALIBRATION_OBJECTIVE:-ap_first}"
+STACK_CALIBRATOR="${STACK_CALIBRATOR:-quantile}"
+QUANTILE_CALIBRATION_BLEND="${QUANTILE_CALIBRATION_BLEND:-0.9}"
 HUMAN_WEIGHT="${HUMAN_WEIGHT:-2.0}"
 META_C="${META_C:-1.0}"
 N_FOLDS="${N_FOLDS:-5}"
@@ -33,7 +38,9 @@ SEED="${SEED:-42}"
 MAX_FEATURES="${MAX_FEATURES:-0}"
 CALIBRATION_FRACTION="${CALIBRATION_FRACTION:-0.25}"
 ROBUST_FEATURES_ONLY="${ROBUST_FEATURES_ONLY:-1}"
-NO_SCORE_REMAP="${NO_SCORE_REMAP:-1}"
+NO_SCORE_REMAP="${NO_SCORE_REMAP:-0}"
+LOW_SCORE_REMAP="${LOW_SCORE_REMAP:-0}"
+NO_SCORE_LOGIT_TUNE="${NO_SCORE_LOGIT_TUNE:-1}"
 
 EXTRA_ARGS=()
 if [[ -n "$HOLDOUT_SOURCE_DATES" ]]; then
@@ -54,6 +61,12 @@ fi
 if [[ "${DISABLE_CATBOOST:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--disable-catboost)
 fi
+if [[ "${DISABLE_EXTRATREES:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--disable-extratrees)
+fi
+if [[ "${DISABLE_RANDOMFOREST:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--disable-randomforest)
+fi
 if [[ "${ENABLE_GPU_TREES:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--enable-gpu-trees)
 fi
@@ -67,7 +80,10 @@ if [[ "${ENABLE_SEQUENCE:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--sequence-action-layers "${SEQUENCE_ACTION_LAYERS:-2}")
   EXTRA_ARGS+=(--sequence-hand-layers "${SEQUENCE_HAND_LAYERS:-1}")
   EXTRA_ARGS+=(--sequence-dropout "${SEQUENCE_DROPOUT:-0.1}")
-  EXTRA_ARGS+=(--sequence-device "${SEQUENCE_DEVICE:-cpu}")
+  EXTRA_ARGS+=(--sequence-device "${SEQUENCE_DEVICE:-cuda}")
+fi
+if [[ "${SEQUENCE_ONLY:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--sequence-only)
 fi
 if [[ "${NO_MINER_VISIBLE:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--no-miner-visible-payload)
@@ -78,6 +94,17 @@ fi
 if [[ "$NO_SCORE_REMAP" == "1" ]]; then
   EXTRA_ARGS+=(--no-score-remap)
 fi
+if [[ "$LOW_SCORE_REMAP" == "1" ]]; then
+  EXTRA_ARGS+=(--low-score-remap)
+  EXTRA_ARGS+=(--live-anchor-human "${LIVE_ANCHOR_HUMAN:-0.006}")
+  EXTRA_ARGS+=(--live-anchor-bot "${LIVE_ANCHOR_BOT:-0.012}")
+fi
+if [[ "$NO_SCORE_LOGIT_TUNE" == "1" ]]; then
+  EXTRA_ARGS+=(--no-score-logit-tune)
+fi
+EXTRA_ARGS+=(--calibration-objective "$CALIBRATION_OBJECTIVE")
+EXTRA_ARGS+=(--stack-calibrator "$STACK_CALIBRATOR")
+EXTRA_ARGS+=(--quantile-calibration-blend "$QUANTILE_CALIBRATION_BLEND")
 
 mkdir -p "$(dirname "$OUTPUT")" logs
 

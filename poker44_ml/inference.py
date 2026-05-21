@@ -202,7 +202,6 @@ class Poker44Model:
             "raw_scores": [round(value, 6) for value in raw_scores],
             "calibrated_scores": [round(value, 6) for value in calibrated_scores],
             "remapped_scores": [round(value, 6) for value in remapped_scores],
-            "logit_scores": [round(value, 6) for value in logit_scores],
             "final_scores": [round(value, 6) for value in logit_scores],
         }
 

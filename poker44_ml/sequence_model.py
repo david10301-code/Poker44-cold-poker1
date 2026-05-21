@@ -81,10 +81,22 @@ _ACTOR_ROLE_HERO = 1
 _ACTOR_ROLE_BUTTON = 2
 _ACTOR_ROLE_OTHER = 3
 
+# Mirrors real competition payload canonicalization which coarsens amounts.
+_AMOUNT_BUCKETS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 56.0, 84.0, 126.0)
+_AMOUNT_BUCKET_VOCAB_SIZE = len(_AMOUNT_BUCKETS) + 1  # + pad
+_POT_FLOW_VOCAB = {
+    "<pad>": 0,
+    "flat": 1,
+    "small_up": 2,
+    "medium_up": 3,
+    "large_up": 4,
+}
+
 
 MAX_ACTIONS_PER_HAND = 16
 MAX_HANDS_PER_CHUNK = 16
-CONT_DIM = 6  # amount_bb, raise_to_bb, call_to_bb, pot_before_bb, pot_after_bb, pot_delta_bb
+# Keep only robust numeric channels consistently present in live payloads.
+CONT_DIM = 3  # amount_bb, pot_after_bb, pot_delta_bb
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -134,6 +146,25 @@ def _to_bb(value: Any, bb: float) -> float:
     return _safe_float(value, 0.0) / bb
 
 
+def _bucket_id(value_bb: float) -> int:
+    value = max(0.0, float(value_bb))
+    if value <= 0.0:
+        return 1
+    nearest = min(_AMOUNT_BUCKETS, key=lambda b: abs(b - value))
+    return _AMOUNT_BUCKETS.index(nearest) + 1
+
+
+def _pot_flow_id(pot_before_bb: float, pot_after_bb: float) -> int:
+    delta = max(0.0, float(pot_after_bb) - float(pot_before_bb))
+    if delta <= 1e-6:
+        return _POT_FLOW_VOCAB["flat"]
+    if delta <= 1.0:
+        return _POT_FLOW_VOCAB["small_up"]
+    if delta <= 4.0:
+        return _POT_FLOW_VOCAB["medium_up"]
+    return _POT_FLOW_VOCAB["large_up"]
+
+
 def encode_hand(hand: Dict[str, Any]) -> Dict[str, np.ndarray]:
     """Convert a single hand payload into padded token tensors."""
     metadata = hand.get("metadata") or {}
@@ -145,6 +176,8 @@ def encode_hand(hand: Dict[str, Any]) -> Dict[str, np.ndarray]:
     action_type = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
     street = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
     actor_role = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
+    amount_bucket = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
+    pot_flow = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.int64)
     cont = np.zeros((MAX_ACTIONS_PER_HAND, CONT_DIM), dtype=np.float32)
     mask = np.zeros(MAX_ACTIONS_PER_HAND, dtype=np.bool_)
 
@@ -161,22 +194,21 @@ def encode_hand(hand: Dict[str, Any]) -> Dict[str, np.ndarray]:
         amount_bb = _safe_float(action.get("normalized_amount_bb"), 0.0)
         if amount_bb == 0.0:
             amount_bb = _to_bb(action.get("amount"), bb)
-        raise_to_bb = _to_bb(action.get("raise_to"), bb)
-        call_to_bb = _to_bb(action.get("call_to"), bb)
         pot_before_bb = _to_bb(action.get("pot_before"), bb)
         pot_after_bb = _to_bb(action.get("pot_after"), bb)
+        amount_bucket[idx] = _bucket_id(amount_bb)
+        pot_flow[idx] = _pot_flow_id(pot_before_bb, pot_after_bb)
         cont[idx, 0] = math.log1p(max(amount_bb, 0.0))
-        cont[idx, 1] = math.log1p(max(raise_to_bb, 0.0))
-        cont[idx, 2] = math.log1p(max(call_to_bb, 0.0))
-        cont[idx, 3] = math.log1p(max(pot_before_bb, 0.0))
-        cont[idx, 4] = math.log1p(max(pot_after_bb, 0.0))
-        cont[idx, 5] = math.log1p(max(pot_after_bb - pot_before_bb, 0.0))
+        cont[idx, 1] = math.log1p(max(pot_after_bb, 0.0))
+        cont[idx, 2] = math.log1p(max(pot_after_bb - pot_before_bb, 0.0))
         mask[idx] = True
 
     return {
         "action_type": action_type,
         "street": street,
         "actor_role": actor_role,
+        "amount_bucket": amount_bucket,
+        "pot_flow": pot_flow,
         "cont": cont,
         "mask": mask,
     }
@@ -187,6 +219,8 @@ def encode_chunk(chunk: Sequence[Dict[str, Any]]) -> Dict[str, np.ndarray]:
     action_type = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
     street = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
     actor_role = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
+    amount_bucket = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
+    pot_flow = np.zeros((MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND), dtype=np.int64)
     cont = np.zeros(
         (MAX_HANDS_PER_CHUNK, MAX_ACTIONS_PER_HAND, CONT_DIM), dtype=np.float32
     )
@@ -204,6 +238,8 @@ def encode_chunk(chunk: Sequence[Dict[str, Any]]) -> Dict[str, np.ndarray]:
         action_type[hand_idx] = encoded["action_type"]
         street[hand_idx] = encoded["street"]
         actor_role[hand_idx] = encoded["actor_role"]
+        amount_bucket[hand_idx] = encoded["amount_bucket"]
+        pot_flow[hand_idx] = encoded["pot_flow"]
         cont[hand_idx] = encoded["cont"]
         action_mask[hand_idx] = encoded["mask"]
         hand_mask[hand_idx] = bool(encoded["mask"].any())
@@ -212,6 +248,8 @@ def encode_chunk(chunk: Sequence[Dict[str, Any]]) -> Dict[str, np.ndarray]:
         "action_type": action_type,
         "street": street,
         "actor_role": actor_role,
+        "amount_bucket": amount_bucket,
+        "pot_flow": pot_flow,
         "cont": cont,
         "action_mask": action_mask,
         "hand_mask": hand_mask,
@@ -251,7 +289,16 @@ class _ChunkDataset(Dataset):
 def _collate(
     batch: List[Tuple[Dict[str, np.ndarray], float, float]]
 ) -> Dict[str, torch.Tensor]:
-    keys = ("action_type", "street", "actor_role", "cont", "action_mask", "hand_mask")
+    keys = (
+        "action_type",
+        "street",
+        "actor_role",
+        "amount_bucket",
+        "pot_flow",
+        "cont",
+        "action_mask",
+        "hand_mask",
+    )
     out: Dict[str, torch.Tensor] = {}
     for key in keys:
         stacked = np.stack([item[0][key] for item in batch], axis=0)
@@ -338,6 +385,8 @@ class ChunkSetTransformer(nn.Module):
         )
         self.street_emb = nn.Embedding(len(_STREET_VOCAB), d_model, padding_idx=0)
         self.actor_emb = nn.Embedding(4, d_model, padding_idx=_ACTOR_ROLE_PAD)
+        self.amount_bucket_emb = nn.Embedding(_AMOUNT_BUCKET_VOCAB_SIZE, d_model, padding_idx=0)
+        self.pot_flow_emb = nn.Embedding(len(_POT_FLOW_VOCAB), d_model, padding_idx=0)
         self.action_pos_emb = nn.Embedding(MAX_ACTIONS_PER_HAND, d_model)
         self.cont_proj = nn.Linear(CONT_DIM, d_model)
         self.input_norm = nn.LayerNorm(d_model)
@@ -382,6 +431,8 @@ class ChunkSetTransformer(nn.Module):
         action_type: torch.Tensor,
         street: torch.Tensor,
         actor_role: torch.Tensor,
+        amount_bucket: torch.Tensor,
+        pot_flow: torch.Tensor,
         cont: torch.Tensor,
         action_mask: torch.Tensor,
         hand_mask: torch.Tensor,
@@ -395,6 +446,8 @@ class ChunkSetTransformer(nn.Module):
         flat_action_type = action_type.reshape(batch * hands, actions)
         flat_street = street.reshape(batch * hands, actions)
         flat_actor = actor_role.reshape(batch * hands, actions)
+        flat_amount_bucket = amount_bucket.reshape(batch * hands, actions)
+        flat_pot_flow = pot_flow.reshape(batch * hands, actions)
         flat_cont = cont.reshape(batch * hands, actions, -1)
         flat_action_mask = action_mask.reshape(batch * hands, actions)
 
@@ -402,6 +455,8 @@ class ChunkSetTransformer(nn.Module):
             self.action_type_emb(flat_action_type)
             + self.street_emb(flat_street)
             + self.actor_emb(flat_actor)
+            + self.amount_bucket_emb(flat_amount_bucket)
+            + self.pot_flow_emb(flat_pot_flow)
             + self.action_pos_emb(position_ids)
             + self.cont_proj(flat_cont)
         )
@@ -442,6 +497,7 @@ class SequenceModelWrapper:
     seed: int = 42
     device: str = "cpu"
     verbose: bool = False
+    verbose_metrics: bool = True
     _model_state: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -518,6 +574,8 @@ class SequenceModelWrapper:
                     action_type=batch["action_type"].to(self.device),
                     street=batch["street"].to(self.device),
                     actor_role=batch["actor_role"].to(self.device),
+                    amount_bucket=batch["amount_bucket"].to(self.device),
+                    pot_flow=batch["pot_flow"].to(self.device),
                     cont=batch["cont"].to(self.device),
                     action_mask=batch["action_mask"].to(self.device),
                     hand_mask=batch["hand_mask"].to(self.device),
@@ -540,6 +598,16 @@ class SequenceModelWrapper:
                     f"train_loss={total_train / max(n_train, 1):.4f} "
                     f"val_loss={val_loss:.4f}"
                 )
+            if self.verbose_metrics and len(val_chunks) > 0:
+                from poker44_ml.chunk_score_metrics import print_chunk_score_diagnostics
+
+                val_proba = self._predict_proba_model(model, val_chunks)[:, 1]
+                print_chunk_score_diagnostics(
+                    f"seq epoch {epoch + 1}/{self.n_epochs} val",
+                    val_labels.tolist(),
+                    val_proba.tolist(),
+                    indent="    ",
+                )
             if val_loss + 1e-5 < best_val_loss:
                 best_val_loss = val_loss
                 best_state = {
@@ -557,7 +625,58 @@ class SequenceModelWrapper:
             "state_dict": {key: tensor.cpu() for key, tensor in model.state_dict().items()},
             "config": self.config.to_dict(),
         }
+        if self.verbose_metrics:
+            from poker44_ml.chunk_score_metrics import print_chunk_score_diagnostics
+
+            train_proba = self._predict_proba_model(model, train_chunks)[:, 1]
+            print_chunk_score_diagnostics(
+                "seq fit train (best checkpoint)",
+                train_labels.tolist(),
+                train_proba.tolist(),
+                indent="    ",
+            )
+            if len(val_chunks) > 0:
+                val_proba = self._predict_proba_model(model, val_chunks)[:, 1]
+                print_chunk_score_diagnostics(
+                    "seq fit val (best checkpoint)",
+                    val_labels.tolist(),
+                    val_proba.tolist(),
+                    indent="    ",
+                )
         return self
+
+    def _predict_proba_model(
+        self,
+        model: ChunkSetTransformer,
+        chunks: Sequence[Sequence[Dict[str, Any]]],
+    ) -> np.ndarray:
+        if not chunks:
+            return np.zeros((0, 2), dtype=np.float64)
+        ds = _ChunkDataset(
+            list(chunks),
+            np.zeros(len(chunks), dtype=np.float32),
+            np.ones(len(chunks), dtype=np.float32),
+        )
+        loader = DataLoader(ds, batch_size=self.batch_size, shuffle=False, collate_fn=_collate)
+        model.eval()
+        logits: List[float] = []
+        with torch.no_grad():
+            for batch in loader:
+                batch_logits = model(
+                    action_type=batch["action_type"].to(self.device),
+                    street=batch["street"].to(self.device),
+                    actor_role=batch["actor_role"].to(self.device),
+                    amount_bucket=batch["amount_bucket"].to(self.device),
+                    pot_flow=batch["pot_flow"].to(self.device),
+                    cont=batch["cont"].to(self.device),
+                    action_mask=batch["action_mask"].to(self.device),
+                    hand_mask=batch["hand_mask"].to(self.device),
+                )
+                logits.extend(batch_logits.detach().cpu().tolist())
+        arr = np.asarray(logits, dtype=np.float64)
+        arr = 1.0 / (1.0 + np.exp(-np.clip(arr, -40.0, 40.0)))
+        arr = np.clip(arr, 1e-6, 1.0 - 1e-6)
+        return np.column_stack([1.0 - arr, arr])
 
     def _evaluate_loss(
         self,
@@ -576,6 +695,8 @@ class SequenceModelWrapper:
                     action_type=batch["action_type"].to(self.device),
                     street=batch["street"].to(self.device),
                     actor_role=batch["actor_role"].to(self.device),
+                    amount_bucket=batch["amount_bucket"].to(self.device),
+                    pot_flow=batch["pot_flow"].to(self.device),
                     cont=batch["cont"].to(self.device),
                     action_mask=batch["action_mask"].to(self.device),
                     hand_mask=batch["hand_mask"].to(self.device),
@@ -593,29 +714,7 @@ class SequenceModelWrapper:
             raise RuntimeError("SequenceModelWrapper.predict_proba called before fit.")
         model = ChunkSetTransformer(self.config).to(self.device)
         model.load_state_dict(self._model_state["state_dict"])
-        model.eval()
-        ds = _ChunkDataset(list(chunks))
-        loader = DataLoader(
-            ds,
-            batch_size=max(self.batch_size, 1),
-            shuffle=False,
-            collate_fn=_collate,
-        )
-        out: List[float] = []
-        with torch.no_grad():
-            for batch in loader:
-                logits = model(
-                    action_type=batch["action_type"].to(self.device),
-                    street=batch["street"].to(self.device),
-                    actor_role=batch["actor_role"].to(self.device),
-                    cont=batch["cont"].to(self.device),
-                    action_mask=batch["action_mask"].to(self.device),
-                    hand_mask=batch["hand_mask"].to(self.device),
-                )
-                out.extend(torch.sigmoid(logits).cpu().tolist())
-        arr = np.asarray(out, dtype=np.float64)
-        arr = np.clip(arr, 0.0, 1.0)
-        return np.stack([1.0 - arr, arr], axis=1)
+        return self._predict_proba_model(model, chunks)
 
     def predict_chunk_scores(
         self, chunks: Sequence[Sequence[Dict[str, Any]]]
@@ -634,6 +733,7 @@ class SequenceModelWrapper:
             "seed": int(self.seed),
             "device": str(self.device),
             "verbose": bool(self.verbose),
+            "verbose_metrics": bool(self.verbose_metrics),
             "_model_state": self._model_state,
         }
 
@@ -647,5 +747,6 @@ class SequenceModelWrapper:
         self.early_stopping_patience = int(state["early_stopping_patience"])
         self.seed = int(state["seed"])
         self.device = str(state["device"])
-        self.verbose = bool(state["verbose"])
+        self.verbose = bool(state.get("verbose", False))
+        self.verbose_metrics = bool(state.get("verbose_metrics", True))
         self._model_state = state.get("_model_state")
