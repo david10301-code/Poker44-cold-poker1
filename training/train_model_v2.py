@@ -384,8 +384,17 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Print prob_min/max, human_prob_max, bot_prob_min, validator FPR/recall "
-            "during sequence training and after each CV fold."
+            "During sequence fit: per-epoch val metrics plus train/val summary "
+            "(prob_min/max, bot_recall, FPR, etc.). Default on."
+        ),
+    )
+    parser.add_argument(
+        "--oof-learner-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Each CV fold: print OOF prob_min/max, human_prob_max, bot_prob_min, "
+            "validator bot_recall/FPR for every base learner and sequence. Default on."
         ),
     )
     parser.add_argument(
@@ -1289,6 +1298,16 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     if sequence_enabled:
         column_names.append("sequence")
     print("Base learners:", ", ".join(column_names))
+    if sequence_enabled and args.sequence_verbose_metrics:
+        print(
+            "Sequence training metrics: ON (per-epoch val + fold OOF; "
+            "disable with --no-sequence-verbose-metrics)"
+        )
+    if args.oof_learner_metrics:
+        print(
+            "Per-fold OOF learner metrics: ON (prob_min/max, bot_recall, FPR; "
+            "disable with --no-oof-learner-metrics)"
+        )
 
     train_chunks = [example["chunk"] for example in train_examples]
 
@@ -1311,7 +1330,14 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         for model_idx, (name, model_proto) in enumerate(base_specs):
             model = _clone(model_proto)
             _fit(model, x_tr, y_tr, w_tr)
-            oof[va_idx, model_idx] = _proba_pos(model, x_va)
+            base_proba = _proba_pos(model, x_va)
+            oof[va_idx, model_idx] = base_proba
+            if args.oof_learner_metrics:
+                print_chunk_score_diagnostics(
+                    f"fold {fold_idx + 1}/{n_folds} {name} OOF",
+                    y_train[va_idx].tolist(),
+                    base_proba.tolist(),
+                )
         if sequence_enabled:
             seq_model = _make_sequence_model(args)
             seq_train_chunks = [train_chunks[i] for i in tr_idx]
@@ -1324,7 +1350,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
                 [train_chunks[i] for i in va_idx]
             )[:, 1]
             oof[va_idx, len(base_specs)] = seq_proba
-            if args.sequence_verbose_metrics:
+            if args.oof_learner_metrics:
                 print_chunk_score_diagnostics(
                     f"fold {fold_idx + 1}/{n_folds} sequence OOF",
                     y_train[va_idx].tolist(),
