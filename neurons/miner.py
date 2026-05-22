@@ -1,12 +1,13 @@
-"""Challenge-aligned Poker44 miner with deterministic chunk heuristics."""
+"""Poker44 miner with local stacked-model inference and transparent model manifests."""
 
+import hashlib
 import logging as stdlogging
 import os
 import subprocess
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Dict, List, Tuple
 
 import bittensor as bt
 
@@ -97,18 +98,10 @@ class Miner(BaseMinerNeuron):
 
         bt.logging.info(f"🤖 Poker44 Miner started with backend={self.backend}")
         runtime_commit = self._repo_head(repo_root)
-        runtime_repo_url = self._repo_url(repo_root)
-        published_repo_commit = (
-            str(self.predictor.metadata.get("repo_commit", "")).strip()
-            if self.predictor is not None
-            else runtime_commit
-        ) or runtime_commit
-        published_repo_url = (
-            str(self.predictor.metadata.get("repo_url", "")).strip()
-            if self.predictor is not None
-            else runtime_repo_url
-        ) or runtime_repo_url
+        runtime_repo_url = self._normalize_repo_url(self._repo_url(repo_root))
         model_metadata = dict(self.predictor.metadata) if self.predictor is not None else {}
+        artifact_repo_commit = str(model_metadata.get("repo_commit", "")).strip()
+        artifact_repo_url = self._normalize_repo_url(str(model_metadata.get("repo_url", "")).strip())
         benchmark_rows = int(float(model_metadata.get("benchmark_rows", 0.0) or 0.0))
         ensemble_combiner = str(model_metadata.get("ensemble_combiner", "") or "").strip()
         ensemble_max_blend = model_metadata.get("ensemble_max_blend")
@@ -159,73 +152,158 @@ class Miner(BaseMinerNeuron):
                 f"bot_quantile={threshold_calibrator.get('bot_quantile')} "
                 f"aggregation={threshold_calibrator.get('aggregation')}"
             )
-        training_data_statement = (
-            f"Trained on {benchmark_rows or 'released'} benchmark chunks with groundTruth labels."
-            if self.predictor is not None
-            else "Reference heuristic miner. No training step. Uses only runtime chunk features."
+        training_data_statement = self._training_data_statement(
+            model_metadata, benchmark_rows=benchmark_rows
         )
         training_data_sources = (
             ["released_training_benchmark"] if self.predictor is not None else ["none"]
         )
+        private_data_attestation = (
+            "No validator-private data used. Supervised artifacts use "
+            "released benchmark labels only."
+            if self.predictor is not None
+            else "This miner does not train on validator-only evaluation data."
+        )
+        manifest_notes = (
+            supervised_notes
+            if self.predictor is not None
+            else "Challenge-aligned heuristic miner that scores chunk-level "
+            "behavioral regularity and action patterns."
+        )
+        if self.predictor is not None and (
+            artifact_repo_commit and artifact_repo_commit != runtime_commit
+            or artifact_repo_url and artifact_repo_url != runtime_repo_url
+        ):
+            manifest_notes += (
+                f"; training_artifact_repo={artifact_repo_url or 'unknown'}"
+                f", training_artifact_commit={artifact_repo_commit or 'unknown'}"
+            )
+        artifact_sha256 = ""
+        if self.predictor is not None and self.model_path.is_file():
+            artifact_sha256 = self._sha256_file(self.model_path)
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
-            implementation_files=[
-                Path(__file__).resolve(),
-                repo_root / "poker44_ml" / "inference.py",
-                repo_root / "poker44_ml" / "features.py",
-            ],
+            implementation_files=self._implementation_files(
+                repo_root, has_predictor=self.predictor is not None
+            ),
             defaults={
                 "model_name": (
-                    "poker44_benchmark_supervised"
+                    str(model_metadata.get("model_name", "")).strip()
+                    or "poker44-benchmark-supervised"
                     if self.predictor is not None
                     else "poker44-reference-heuristic"
                 ),
                 "model_version": (
-                    "1" if self.predictor is not None else "2"
+                    str(model_metadata.get("model_version", "")).strip() or "1"
+                    if self.predictor is not None
+                    else "2"
                 ),
                 "framework": (
-                    self.predictor.metadata.get("framework", "benchmark-supervised")
+                    str(model_metadata.get("framework", "stacked-sequence-v2")).strip()
                     if self.predictor is not None
                     else "python-heuristic"
                 ),
-                "repo_commit": published_repo_commit,
-                "repo_url": published_repo_url,
-                "notes": (
-                    supervised_notes
-                    if self.predictor is not None
-                    else "Challenge-aligned heuristic miner that scores chunk-level "
-                    "behavioral regularity and action patterns."
-                ),
+                "license": "MIT",
+                "repo_commit": runtime_commit,
+                "repo_url": runtime_repo_url,
+                "artifact_url": str(self.model_path.resolve()) if self.predictor is not None else "",
+                "artifact_sha256": artifact_sha256,
+                "notes": manifest_notes,
                 "open_source": True,
-                "inference_mode": "remote",
+                "inference_mode": (
+                    "local-joblib" if self.predictor is not None else "heuristic"
+                ),
                 "training_data_statement": training_data_statement,
                 "training_data_sources": training_data_sources,
-                "private_data_attestation": (
-                    "No validator-private data used. Supervised artifacts use "
-                    "released benchmark labels."
-                ),
+                "private_data_attestation": private_data_attestation,
+                "data_attestation": private_data_attestation,
             },
         )
-        override_repo_url = os.getenv("POKER44_MODEL_REPO_URL", "").strip()
-        override_repo_commit = os.getenv("POKER44_MODEL_REPO_COMMIT", "").strip()
-        if override_repo_url and override_repo_url != published_repo_url:
-            bt.logging.warning(
-                "Ignoring POKER44_MODEL_REPO_URL override because it does not match "
-                f"the active model/runtime identity | override={override_repo_url} "
-                f"published={published_repo_url}"
-            )
-        if override_repo_commit and override_repo_commit != published_repo_commit:
-            bt.logging.warning(
-                "Ignoring POKER44_MODEL_REPO_COMMIT override because it does not match "
-                f"the active model/runtime identity | override={override_repo_commit} "
-                f"published={published_repo_commit}"
-            )
-        self.model_manifest["repo_url"] = published_repo_url
-        self.model_manifest["repo_commit"] = published_repo_commit
         self.manifest_compliance = evaluate_manifest_compliance(self.model_manifest)
         self.manifest_digest = manifest_digest(self.model_manifest)
         self._log_manifest_startup(repo_root)
         bt.logging.info(f"Axon created: {self.axon}")
+
+    @staticmethod
+    def _normalize_repo_url(url: str) -> str:
+        cleaned = str(url or "").strip()
+        if not cleaned:
+            return ""
+        if cleaned.startswith("git@"):
+            host_path = cleaned.split(":", 1)
+            if len(host_path) == 2:
+                host = host_path[0][4:]
+                path = host_path[1]
+                if path.endswith(".git"):
+                    path = path[:-4]
+                return f"https://{host}/{path}"
+        if cleaned.endswith(".git"):
+            cleaned = cleaned[:-4]
+        return cleaned
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _implementation_files(cls, repo_root: Path, *, has_predictor: bool) -> List[Path]:
+        files = [Path(__file__).resolve()]
+        if not has_predictor:
+            return files
+        for relative in (
+            "poker44_ml/inference.py",
+            "poker44_ml/features.py",
+            "poker44_ml/sequence_model.py",
+            "poker44_ml/stacked.py",
+            "poker44_ml/calibration.py",
+            "poker44/validator/payload_view.py",
+        ):
+            candidate = repo_root / relative
+            if candidate.exists():
+                files.append(candidate)
+        return files
+
+    @staticmethod
+    def _training_data_statement(
+        model_metadata: Dict[str, Any],
+        *,
+        benchmark_rows: int,
+    ) -> str:
+        if not model_metadata:
+            return (
+                "Reference heuristic miner. No training step. "
+                "Uses only runtime chunk features."
+            )
+        parts = [
+            (
+                f"Trained on {benchmark_rows} released benchmark chunks with groundTruth labels."
+                if benchmark_rows
+                else "Trained on released benchmark chunks with groundTruth labels."
+            )
+        ]
+        holdout = model_metadata.get("holdout_source_dates")
+        if holdout:
+            parts.append(f"Holdout source dates: {holdout}.")
+        excluded = model_metadata.get("excluded_train_source_dates")
+        if excluded:
+            parts.append(f"Excluded train source dates: {excluded}.")
+        if model_metadata.get("no_score_remap"):
+            parts.append("Post-training score_remap disabled.")
+        sequence_config = model_metadata.get("sequence_config")
+        if isinstance(sequence_config, dict) and sequence_config:
+            parts.append(
+                "Sequence learner config: "
+                f"d_model={sequence_config.get('d_model', 'unknown')}, "
+                f"epochs={sequence_config.get('epochs', 'unknown')}."
+            )
+        return " ".join(parts)
 
     @staticmethod
     def _repo_head(repo_root: Path) -> str:
@@ -281,7 +359,8 @@ class Miner(BaseMinerNeuron):
         bt.logging.info("Open-sourced miner manifest standard active for this miner.")
         bt.logging.info(
             f"Miner transparency status: {self.manifest_compliance['status']} "
-            f"(missing_fields={self.manifest_compliance['missing_fields']})"
+            f"(missing_fields={self.manifest_compliance['missing_fields']} "
+            f"policy_violations={self.manifest_compliance.get('policy_violations', [])})"
         )
         bt.logging.info(
             f"Manifest summary | model={self.model_manifest.get('model_name', '')} "

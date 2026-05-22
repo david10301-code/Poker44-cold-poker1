@@ -115,6 +115,15 @@ def build_local_model_manifest(
             "POKER44_MODEL_PRIVATE_DATA_ATTESTATION",
             str(default_values.get("private_data_attestation", "")),
         ).strip(),
+        "data_attestation": os.getenv(
+            "POKER44_MODEL_DATA_ATTESTATION",
+            str(
+                default_values.get(
+                    "data_attestation",
+                    default_values.get("private_data_attestation", ""),
+                )
+            ),
+        ).strip(),
         "inference_mode": os.getenv(
             "POKER44_MODEL_INFERENCE_MODE",
             str(default_values.get("inference_mode", "remote")),
