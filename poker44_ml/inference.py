@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover
     joblib = None
 
 # Decimal places for miner debug logs (raw / remap / final components).
-SCORE_LOG_DECIMALS = 4
+SCORE_LOG_DECIMALS = 8
 
 
 class Poker44Model:

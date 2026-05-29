@@ -5,6 +5,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+from poker44.score.scoring import reward_eval
 from poker44_ml.inference import Poker44Model
 from training.build_dataset import load_benchmark_examples, resolve_benchmark_paths
 from training.train_model import _enrich_probability_metrics
@@ -34,17 +37,66 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print a compact metric summary for each sourceDate.",
     )
+    parser.add_argument(
+        "--validator-reward-mode",
+        type=str,
+        choices=("live", "base", "soft"),
+        default="live",
+        help=(
+            "How to compute validator_reward for offline comparison. "
+            "live=subnet cliff at FPR>=0.10 (default). "
+            "base=0.65*AP+0.35*recall with no safety gate. "
+            "soft=base*(1-FPR)^2 without the 0.10 cliff. "
+            "live reward is always kept as validator_reward_live when mode!=live."
+        ),
+    )
     return parser.parse_args()
+
+
+def _apply_validator_reward_mode(
+    metrics: dict[str, float],
+    labels: list[int],
+    probabilities: list[float],
+    *,
+    reward_mode: str,
+) -> dict[str, float]:
+    if reward_mode == "live":
+        return metrics
+
+    safe = [max(1e-6, min(1.0 - 1e-6, float(value))) for value in probabilities]
+    eval_reward, details = reward_eval(
+        np.asarray(safe, dtype=float),
+        np.asarray(labels, dtype=int),
+        mode=reward_mode,
+    )
+    out = dict(metrics)
+    out["validator_reward_live"] = float(out.get("validator_reward", 0.0))
+    out["validator_reward"] = float(eval_reward)
+    out["validator_reward_mode"] = reward_mode
+    out["validator_human_safety_penalty"] = float(
+        details.get("human_safety_penalty", 0.0)
+    )
+    if reward_mode == "base":
+        out["validator_base_score"] = float(eval_reward)
+    return out
 
 
 def _evaluate_examples(
     model: Poker44Model,
     examples: list[dict[str, Any]],
+    *,
+    reward_mode: str = "live",
 ) -> dict[str, float]:
     chunks = [list(example["chunk"]) for example in examples]
     labels = [int(example["label"]) for example in examples]
     probabilities = model.predict_chunk_scores(chunks)
-    return _enrich_probability_metrics(labels, probabilities)
+    metrics = _enrich_probability_metrics(labels, probabilities)
+    return _apply_validator_reward_mode(
+        metrics,
+        labels,
+        probabilities,
+        reward_mode=reward_mode,
+    )
 
 
 def _filter_examples(
@@ -70,7 +122,9 @@ def _print_metric_block(title: str, metrics: dict[str, float], rows: int) -> Non
         "log_loss",
         "brier_score",
         "mcc_at_0_5",
+        "validator_reward_mode",
         "validator_reward",
+        "validator_reward_live",
         "validator_fpr",
         "validator_bot_recall",
         "validator_ap_score",
@@ -93,8 +147,13 @@ def _print_metric_block(title: str, metrics: dict[str, float], rows: int) -> Non
         "threshold_margin_at_0_5",
         "prob_mean",
     ):
-        if key in metrics:
-            print(f"{key}={float(metrics[key]):.6f}")
+        if key not in metrics:
+            continue
+        value = metrics[key]
+        if isinstance(value, str):
+            print(f"{key}={value}")
+        else:
+            print(f"{key}={float(value):.6f}")
 
 
 def main() -> None:
@@ -115,9 +174,11 @@ def main() -> None:
     )
 
     model = Poker44Model(args.model_path)
-    metrics = _evaluate_examples(model, examples)
+    reward_mode = str(args.validator_reward_mode)
+    metrics = _evaluate_examples(model, examples, reward_mode=reward_mode)
 
     print(f"Model path: {args.model_path}")
+    print(f"Validator reward mode: {reward_mode}")
     print(f"Benchmark files: {len(benchmark_paths)}")
     print(f"Source dates: {source_dates}")
     print(
@@ -134,7 +195,11 @@ def main() -> None:
             ]
             if not date_examples:
                 continue
-            date_metrics = _evaluate_examples(model, date_examples)
+            date_metrics = _evaluate_examples(
+                model,
+                date_examples,
+                reward_mode=reward_mode,
+            )
             _print_metric_block(f"Per-source-date metrics | {source_date}", date_metrics, len(date_examples))
 
 

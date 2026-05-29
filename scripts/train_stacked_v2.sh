@@ -10,6 +10,9 @@
 #   OUTPUT=models/poker44_stacked_robust.joblib ./scripts/train_stacked_v2.sh
 #   HOLDOUT_SOURCE_DATES=2026-05-08 EXCLUDE_TRAIN_SOURCE_DATES=2026-05-07 ./scripts/train_stacked_v2.sh
 #
+# Piecewise sequence LR (epochs 1-4 at 1.3e-3, then 5-8 at 1e-3):
+#   SEQUENCE_EPOCHS=8 SEQUENCE_LEARNING_RATE_SCHEDULE="1.3e-3:4,1e-3:4" ./scripts/train_stacked_v2.sh
+#
 # Legacy full-feature + score_remap training:
 #   ROBUST_FEATURES_ONLY=0 NO_SCORE_REMAP=0 ./scripts/train_stacked_v2.sh
 #
@@ -74,6 +77,9 @@ if [[ "${ENABLE_SEQUENCE:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--sequence-epochs "${SEQUENCE_EPOCHS:-4}")
   EXTRA_ARGS+=(--sequence-batch-size "${SEQUENCE_BATCH_SIZE:-32}")
   EXTRA_ARGS+=(--sequence-learning-rate "${SEQUENCE_LEARNING_RATE:-1e-3}")
+  if [[ -n "${SEQUENCE_LEARNING_RATE_SCHEDULE:-}" ]]; then
+    EXTRA_ARGS+=(--sequence-learning-rate-schedule "$SEQUENCE_LEARNING_RATE_SCHEDULE")
+  fi
   EXTRA_ARGS+=(--sequence-d-model "${SEQUENCE_D_MODEL:-64}")
   EXTRA_ARGS+=(--sequence-heads "${SEQUENCE_HEADS:-4}")
   EXTRA_ARGS+=(--sequence-action-layers "${SEQUENCE_ACTION_LAYERS:-2}")

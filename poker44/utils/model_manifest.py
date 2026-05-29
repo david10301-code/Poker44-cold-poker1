@@ -25,6 +25,22 @@ REFERENCE_MINER_MODEL_NAMES = {
 }
 REFERENCE_REPO_URL = "https://github.com/Poker44/Poker44-subnet"
 GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_ARTIFACT_VERSION_RE = re.compile(r"_v(\d+)$", re.IGNORECASE)
+
+
+def artifact_model_identity(artifact_path: str | Path) -> Dict[str, str]:
+    """Derive manifest ``model_name`` / ``model_version`` from a joblib filename."""
+    path = Path(artifact_path)
+    stem = (path.stem or "poker44-model").strip()
+    version = "1"
+    match = _ARTIFACT_VERSION_RE.search(stem)
+    if match:
+        version = match.group(1)
+    return {
+        "model_name": stem,
+        "model_version": version,
+        "artifact_filename": path.name,
+    }
 
 
 def _parse_bool(value: str | None, *, default: bool = False) -> bool:
@@ -138,6 +154,9 @@ def build_local_model_manifest(
             str(default_values.get("notes", "")),
         ).strip(),
     }
+    artifact_filename = str(default_values.get("artifact_filename", "")).strip()
+    if artifact_filename:
+        manifest["artifact_filename"] = artifact_filename
     return normalize_model_manifest(manifest)
 
 

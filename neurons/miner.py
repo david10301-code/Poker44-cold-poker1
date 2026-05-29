@@ -13,6 +13,7 @@ import bittensor as bt
 
 from poker44.base.miner import BaseMinerNeuron
 from poker44.utils.model_manifest import (
+    artifact_model_identity,
     build_local_model_manifest,
     evaluate_manifest_compliance,
     manifest_digest,
@@ -81,9 +82,10 @@ class Miner(BaseMinerNeuron):
         self.model_path = Path(
             os.getenv(
                 "POKER44_MODEL_PATH",
-                str(repo_root / "models" / "poker44_benchmark_supervised.joblib"),
+                str(repo_root / "models" / "poker44_stacked_robust.joblib"),
             )
         )
+        self._artifact_identity = artifact_model_identity(self.model_path)
         self.predictor = None
         self.backend = "heuristic"
         if Poker44Model is not None and self.model_path.exists():
@@ -117,6 +119,12 @@ class Miner(BaseMinerNeuron):
         supervised_notes = (
             "Supervised benchmark model trained on released evaluation chunks"
         )
+        artifact_filename = str(
+            model_metadata.get("artifact_filename", "")
+            or self._artifact_identity.get("artifact_filename", "")
+        ).strip()
+        if artifact_filename:
+            supervised_notes += f"; artifact={artifact_filename}"
         if ensemble_combiner:
             supervised_notes += f"; ensemble_combiner={ensemble_combiner}"
             if ensemble_max_blend is not None:
@@ -189,19 +197,33 @@ class Miner(BaseMinerNeuron):
             defaults={
                 "model_name": (
                     str(model_metadata.get("model_name", "")).strip()
-                    or "poker44-benchmark-supervised"
+                    or self._artifact_identity.get("model_name", "")
+                    or "poker44_stacked_robust"
                     if self.predictor is not None
                     else "poker44-reference-heuristic"
                 ),
                 "model_version": (
-                    str(model_metadata.get("model_version", "")).strip() or "1"
+                    str(model_metadata.get("model_version", "")).strip()
+                    or self._artifact_identity.get("model_version", "")
+                    or "1"
                     if self.predictor is not None
                     else "2"
                 ),
                 "framework": (
-                    str(model_metadata.get("framework", "stacked-sequence-v2")).strip()
+                    str(model_metadata.get("framework", "")).strip()
+                    or (
+                        "stacked-sequence-v2"
+                        if model_metadata.get("sequence_enabled")
+                        else "stacked-v2"
+                    )
                     if self.predictor is not None
                     else "python-heuristic"
+                ),
+                "artifact_filename": (
+                    str(model_metadata.get("artifact_filename", "")).strip()
+                    or self._artifact_identity.get("artifact_filename", "")
+                    if self.predictor is not None
+                    else ""
                 ),
                 "license": "MIT",
                 "repo_commit": runtime_commit,
@@ -298,11 +320,15 @@ class Miner(BaseMinerNeuron):
             parts.append("Post-training score_remap disabled.")
         sequence_config = model_metadata.get("sequence_config")
         if isinstance(sequence_config, dict) and sequence_config:
+            epochs = sequence_config.get("n_epochs", sequence_config.get("epochs", "unknown"))
             parts.append(
                 "Sequence learner config: "
                 f"d_model={sequence_config.get('d_model', 'unknown')}, "
-                f"epochs={sequence_config.get('epochs', 'unknown')}."
+                f"epochs={epochs}, schema_version={sequence_config.get('schema_version', 'unknown')}."
             )
+        artifact_filename = str(model_metadata.get("artifact_filename", "")).strip()
+        if artifact_filename:
+            parts.append(f"Artifact file: {artifact_filename}.")
         return " ".join(parts)
 
     @staticmethod
@@ -568,7 +594,7 @@ class Miner(BaseMinerNeuron):
 
         bot_count = sum(1 for prediction in synapse.predictions if prediction)
         human_count = len(scores) - bot_count
-        score_log_decimals = 4
+        score_log_decimals = 8
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         total_hands = sum(chunk_sizes)

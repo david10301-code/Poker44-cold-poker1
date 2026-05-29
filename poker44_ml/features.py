@@ -95,7 +95,7 @@ def _amount_bucket(value: float) -> str:
         return "m"
     if value <= 5.0:
         return "l"
-    return "xl"
+        return "xl"
 
 
 def _hand_features(hand: dict[str, Any]) -> dict[str, float]:

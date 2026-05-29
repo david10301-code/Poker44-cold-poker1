@@ -42,3 +42,43 @@ def reward(y_pred: np.ndarray, y_true: np.ndarray) -> tuple[float, dict]:
         "reward": rew,
     }
     return rew, res
+
+
+def reward_eval(
+    y_pred: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    mode: str = "live",
+) -> tuple[float, dict]:
+    """Evaluation variants of :func:`reward` for offline model comparison.
+
+    ``live`` — subnet formula (FPR cliff at 0.10).
+    ``base`` — ``0.65 * AP + 0.35 * recall`` with no human-safety gate.
+    ``soft`` — same base score multiplied by ``(1 - FPR)^2`` without the cliff.
+    """
+    _, details = reward(y_pred, y_true)
+    base_score = float(details["base_score"])
+    fpr = float(details["fpr"])
+
+    if mode == "live":
+        return float(details["reward"]), {**details, "reward_mode": "live"}
+
+    if mode == "base":
+        return base_score, {
+            **details,
+            "reward_mode": "base",
+            "human_safety_penalty": 1.0,
+            "reward": base_score,
+        }
+
+    if mode == "soft":
+        penalty = max(0.0, 1.0 - fpr) ** 2
+        rew = base_score * penalty
+        return rew, {
+            **details,
+            "reward_mode": "soft",
+            "human_safety_penalty": penalty,
+            "reward": rew,
+        }
+
+    raise ValueError(f"Unknown reward eval mode: {mode!r}")

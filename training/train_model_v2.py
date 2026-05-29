@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import subprocess
 import warnings
 from collections import Counter
@@ -49,6 +50,7 @@ from poker44_ml.chunk_score_metrics import (
     human_bot_prob_bounds,
     print_chunk_score_diagnostics,
 )
+from poker44.utils.model_manifest import artifact_model_identity
 from poker44_ml.calibration import BlendedQuantileCalibrator
 from poker44_ml.inference import Poker44Model
 from poker44_ml.stacked import StackedEnsemble
@@ -343,6 +345,20 @@ def parse_args() -> argparse.Namespace:
         "--sequence-learning-rate",
         type=float,
         default=1e-3,
+        help=(
+            "Default/fallback LR when --sequence-learning-rate-schedule is "
+            "unset or shorter than --sequence-epochs."
+        ),
+    )
+    parser.add_argument(
+        "--sequence-learning-rate-schedule",
+        type=str,
+        default=None,
+        help=(
+            "Piecewise LR per epoch: lr:epochs segments, comma-separated. "
+            "Example: 1.3e-3:4,1e-3:4 runs 1.3e-3 for epochs 1-4 then 1e-3 "
+            "for 5-8. Extra epochs repeat the last segment LR."
+        ),
     )
     parser.add_argument(
         "--sequence-d-model",
@@ -654,11 +670,13 @@ def _make_sequence_model(args: argparse.Namespace) -> Any:
         max_hands_per_chunk=max(1, int(args.sequence_max_hands)),
         max_actions_per_hand=max(1, int(args.sequence_max_actions)),
     )
+    schedule = str(args.sequence_learning_rate_schedule or "").strip() or None
     return SequenceModelWrapper(
         config=config,
         n_epochs=int(args.sequence_epochs),
         batch_size=int(args.sequence_batch_size),
         learning_rate=float(args.sequence_learning_rate),
+        learning_rate_schedule=schedule,
         seed=int(args.seed),
         device=str(args.sequence_device),
         verbose=bool(args.sequence_verbose),
@@ -1387,6 +1405,19 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     chunk_names: List[str] = []
     if sequence_enabled:
         final_seq_model = _make_sequence_model(args)
+        if final_seq_model.learning_rate_schedule:
+            from poker44_ml.sequence_model import parse_learning_rate_schedule
+
+            epoch_lrs = parse_learning_rate_schedule(
+                final_seq_model.learning_rate_schedule,
+                default_lr=float(final_seq_model.learning_rate),
+                n_epochs=int(final_seq_model.n_epochs),
+            )
+            print(
+                "Sequence learning-rate schedule: "
+                f"{final_seq_model.learning_rate_schedule} -> "
+                f"{[round(lr, 6) for lr in epoch_lrs]}"
+            )
         final_seq_model.fit(
             train_chunks,
             y_train.tolist(),
@@ -1616,6 +1647,23 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
     output_path = Path(args.output)
+    artifact_identity = artifact_model_identity(output_path)
+    metadata.update(
+        {
+            "model_name": artifact_identity["model_name"],
+            "model_version": os.getenv(
+                "POKER44_MODEL_VERSION",
+                artifact_identity["model_version"],
+            ),
+            "artifact_filename": artifact_identity["artifact_filename"],
+        }
+    )
+    if sequence_enabled and chunk_models and isinstance(metadata.get("sequence_config"), dict):
+        metadata["sequence_config"]["n_epochs"] = int(args.sequence_epochs)
+        metadata["sequence_config"]["learning_rate"] = float(args.sequence_learning_rate)
+        schedule = str(args.sequence_learning_rate_schedule or "").strip()
+        if schedule:
+            metadata["sequence_config"]["learning_rate_schedule"] = schedule
     output_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(
         {

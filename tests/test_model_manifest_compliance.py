@@ -1,9 +1,22 @@
 import unittest
 
-from poker44.utils.model_manifest import evaluate_manifest_compliance
+from poker44.utils.model_manifest import (
+    artifact_model_identity,
+    evaluate_manifest_compliance,
+)
 
 
 class ModelManifestComplianceTests(unittest.TestCase):
+    def test_artifact_model_identity_from_joblib_path(self) -> None:
+        identity = artifact_model_identity("models/poker44_stacked_robust.joblib")
+        self.assertEqual(identity["model_name"], "poker44_stacked_robust")
+        self.assertEqual(identity["model_version"], "1")
+        self.assertEqual(identity["artifact_filename"], "poker44_stacked_robust.joblib")
+
+        versioned = artifact_model_identity("models/poker44_stacked_robust_v5.joblib")
+        self.assertEqual(versioned["model_name"], "poker44_stacked_robust_v5")
+        self.assertEqual(versioned["model_version"], "5")
+
     def test_reference_miner_manifest_can_use_reference_repo(self) -> None:
         manifest = {
             "open_source": True,
