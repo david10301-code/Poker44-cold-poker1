@@ -53,7 +53,7 @@ def reward_eval(
     """Evaluation variants of :func:`reward` for offline model comparison.
 
     ``live`` — subnet formula (FPR cliff at 0.10).
-    ``base`` — ``0.65 * AP + 0.35 * recall`` with no human-safety gate.
+    ``base`` — ``base_score * (1-FPR)^2`` (soft penalty, no 0.10 cliff).
     ``soft`` — same base score multiplied by ``(1 - FPR)^2`` without the cliff.
     """
     _, details = reward(y_pred, y_true)
@@ -64,11 +64,13 @@ def reward_eval(
         return float(details["reward"]), {**details, "reward_mode": "live"}
 
     if mode == "base":
-        return base_score, {
+        soft_penalty = max(0.0, 1.0 - fpr) ** 2
+        rew = base_score * soft_penalty
+        return rew, {
             **details,
             "reward_mode": "base",
-            "human_safety_penalty": 1.0,
-            "reward": base_score,
+            "human_safety_penalty": soft_penalty,
+            "reward": rew,
         }
 
     if mode == "soft":

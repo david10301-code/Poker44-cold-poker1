@@ -45,8 +45,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "How to compute validator_reward for offline comparison. "
             "live=subnet cliff at FPR>=0.10 (default). "
-            "base=0.65*AP+0.35*recall with no safety gate. "
-            "soft=base*(1-FPR)^2 without the 0.10 cliff. "
+            "base=base_score*(1-FPR)^2 (no 0.10 cliff). "
+            "soft=same as base (alias). "
             "live reward is always kept as validator_reward_live when mode!=live."
         ),
     )
@@ -76,8 +76,7 @@ def _apply_validator_reward_mode(
     out["validator_human_safety_penalty"] = float(
         details.get("human_safety_penalty", 0.0)
     )
-    if reward_mode == "base":
-        out["validator_base_score"] = float(eval_reward)
+    out["validator_base_score"] = float(details.get("base_score", eval_reward))
     return out
 
 

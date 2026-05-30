@@ -23,7 +23,7 @@ output.png
 flightplans/*
 # model/*
 hands_generator/
-# models/*
+models/*
 runs/*
 # C extensions
 *.so
