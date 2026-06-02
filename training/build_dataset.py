@@ -24,11 +24,15 @@ def load_json_or_gz(path: str | Path) -> Any:
 
 def resolve_benchmark_paths(path: str | Path | None) -> list[Path]:
     if path:
-        candidate = Path(path)
-        if candidate.is_dir():
-            paths = sorted(candidate.glob("training_benchmark*.txt"))
+        raw = str(path).strip()
+        if "," in raw:
+            paths = [Path(item.strip()) for item in raw.split(",") if item.strip()]
         else:
-            paths = [candidate]
+            candidate = Path(raw)
+            if candidate.is_dir():
+                paths = sorted(candidate.glob("training_benchmark*.txt"))
+            else:
+                paths = [candidate]
     else:
         paths = [DEFAULT_BENCHMARK_PATH]
     existing = [candidate for candidate in paths if candidate.exists()]

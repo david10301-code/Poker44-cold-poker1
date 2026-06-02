@@ -25,7 +25,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=str(REPO_ROOT / "models" / "poker44_benchmark_supervised.joblib"),
     )
-    parser.add_argument("--benchmark-path", type=str, default=None)
+    parser.add_argument(
+        "--benchmark-path",
+        type=str,
+        default=None,
+        help=(
+            "Single file, comma-separated files, or directory of "
+            "training_benchmark*.txt."
+        ),
+    )
     parser.add_argument(
         "--source-dates",
         type=str,
