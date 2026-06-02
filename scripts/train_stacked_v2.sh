@@ -36,7 +36,8 @@ STACK_CALIBRATOR="${STACK_CALIBRATOR:-quantile}"
 QUANTILE_CALIBRATION_BLEND="${QUANTILE_CALIBRATION_BLEND:-0.9}"
 HUMAN_WEIGHT="${HUMAN_WEIGHT:-2.0}"
 META_C="${META_C:-1.0}"
-N_FOLDS="${N_FOLDS:-5}"
+N_FOLDS="${N_FOLDS:-5}"          # set to 1 for single holdout split (no k-fold)
+HOLDOUT_FRAC="${HOLDOUT_FRAC:-0.20}"  # val fraction when N_FOLDS=1
 SEED="${SEED:-42}"
 MAX_FEATURES="${MAX_FEATURES:-0}"
 CALIBRATION_FRACTION="${CALIBRATION_FRACTION:-0.25}"
@@ -125,6 +126,7 @@ python -m training.train_model_v2 \
   --human-weight-multiplier "$HUMAN_WEIGHT" \
   --meta-c "$META_C" \
   --n-folds "$N_FOLDS" \
+  --holdout-frac "$HOLDOUT_FRAC" \
   --seed "$SEED" \
   --max-features "$MAX_FEATURES" \
   "${EXTRA_ARGS[@]}" \

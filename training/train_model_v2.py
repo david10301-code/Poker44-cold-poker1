@@ -196,7 +196,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--n-folds", type=int, default=5)
+    parser.add_argument(
+        "--n-folds",
+        type=int,
+        default=5,
+        help="K-fold splits for OOF meta-learner training. Set to 1 to use a single "
+             "holdout split (no cross-validation); controlled by --holdout-frac.",
+    )
+    parser.add_argument(
+        "--holdout-frac",
+        type=float,
+        default=0.20,
+        help="Fraction of training data held out for OOF when --n-folds=1. Default 0.20.",
+    )
     parser.add_argument(
         "--target-fpr",
         type=float,
@@ -1273,13 +1285,30 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         1.0,
     ).astype(np.float64)
 
-    # K-fold OOF predictions for the meta-learner.
-    n_folds = max(2, int(args.n_folds))
-    kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
+    # OOF predictions for the meta-learner.
+    # n_folds=1 → single holdout split (train once, no cross-validation).
+    # n_folds≥2 → standard k-fold OOF.
+    n_folds = max(1, int(args.n_folds))
     oof = np.zeros((len(y_train), len(column_names)), dtype=np.float64)
     fold_aps: List[float] = []
 
-    for fold_idx, (tr_idx, va_idx) in enumerate(kfold.split(x_train_sel, y_train)):
+    if n_folds == 1:
+        # Holdout mode: 80/20 stratified split, train once.
+        holdout_frac = float(getattr(args, "holdout_frac", 0.2))
+        tr_idx, va_idx = train_test_split(
+            np.arange(len(y_train)),
+            test_size=holdout_frac,
+            stratify=y_train,
+            random_state=args.seed,
+        )
+        splits = [(tr_idx, va_idx)]
+        print(f"[no-kfold] single holdout split: train={len(tr_idx)} val={len(va_idx)} (holdout_frac={holdout_frac:.2f})")
+    else:
+        kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
+        splits = list(kfold.split(x_train_sel, y_train))
+
+    for fold_idx, (tr_idx, va_idx) in enumerate(splits):
+        fold_label = "holdout" if n_folds == 1 else f"fold {fold_idx + 1}/{n_folds}"
         x_tr, x_va = x_train_sel[tr_idx], x_train_sel[va_idx]
         y_tr = y_train[tr_idx]
         w_tr = sample_weights[tr_idx]
@@ -1290,7 +1319,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             oof[va_idx, model_idx] = base_proba
             if args.oof_learner_metrics:
                 print_chunk_score_diagnostics(
-                    f"fold {fold_idx + 1}/{n_folds} {name} OOF",
+                    f"{fold_label} {name} OOF",
                     y_train[va_idx].tolist(),
                     base_proba.tolist(),
                 )
@@ -1308,7 +1337,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             oof[va_idx, len(base_specs)] = seq_proba
             if args.oof_learner_metrics:
                 print_chunk_score_diagnostics(
-                    f"fold {fold_idx + 1}/{n_folds} sequence OOF",
+                    f"{fold_label} sequence OOF",
                     y_train[va_idx].tolist(),
                     seq_proba.tolist(),
                 )
@@ -1316,7 +1345,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             average_precision_score(y_train[va_idx], oof[va_idx].mean(axis=1))
         )
         fold_aps.append(fold_ap)
-        print(f"  fold {fold_idx + 1}/{n_folds} mean-base AP={fold_ap:.4f}")
+        print(f"  {fold_label} mean-base AP={fold_ap:.4f}")
 
     # Meta-learner on OOF base predictions.
     meta = LogisticRegression(
