@@ -27,6 +27,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 OUTPUT="${OUTPUT:-models/poker44_stacked_robust.joblib}"
+BENCHMARK_PATH="${BENCHMARK_PATH:-}"
 HOLDOUT_SOURCE_DATES="${HOLDOUT_SOURCE_DATES:-2026-05-08}"
 EXCLUDE_TRAIN_SOURCE_DATES="${EXCLUDE_TRAIN_SOURCE_DATES:-}"
 TARGET_FPR="${TARGET_FPR:-0.04}"
@@ -118,6 +119,7 @@ mkdir -p "$(dirname "$OUTPUT")" logs
 
 python -m training.train_model_v2 \
   --output "$OUTPUT" \
+  ${BENCHMARK_PATH:+--benchmark-path "$BENCHMARK_PATH"} \
   --holdout-source-dates "$HOLDOUT_SOURCE_DATES" \
   --exclude-train-source-dates "$EXCLUDE_TRAIN_SOURCE_DATES" \
   --target-fpr "$TARGET_FPR" \

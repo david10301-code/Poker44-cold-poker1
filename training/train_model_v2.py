@@ -1286,87 +1286,142 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     ).astype(np.float64)
 
     # OOF predictions for the meta-learner.
-    # n_folds=1 → single holdout split (train once, no cross-validation).
-    # n_folds≥2 → standard k-fold OOF.
+    # n_folds=1 → no internal split: train on ALL fit_examples, predict on
+    #             cal_examples to get meta/calibration scores.
+    # n_folds≥2 → standard k-fold OOF on fit_examples.
     n_folds = max(1, int(args.n_folds))
-    oof = np.zeros((len(y_train), len(column_names)), dtype=np.float64)
     fold_aps: List[float] = []
+    # These are set inside the n_folds==1 block and used during final refit.
+    y_train_fit = y_train
+    sample_weights_fit = sample_weights
+    train_chunks_fit = train_chunks
+    x_train_sel_fit = x_train_sel
 
     if n_folds == 1:
-        # Holdout mode: 80/20 stratified split, train once.
-        holdout_frac = float(getattr(args, "holdout_frac", 0.2))
-        tr_idx, va_idx = train_test_split(
-            np.arange(len(y_train)),
-            test_size=holdout_frac,
-            stratify=y_train,
-            random_state=args.seed,
+        # Train on all fit_examples (full 6400), predict on cal_examples (1600).
+        # This gives the most training data to the base model while still
+        # providing clean held-out scores for meta-learner and calibration.
+        if not cal_examples:
+            raise RuntimeError(
+                "N_FOLDS=1 requires a calibration split (--calibration-fraction > 0) "
+                "to produce held-out scores for the meta-learner."
+            )
+        x_cal = _build_matrix(cal_examples, feature_names)[:, feature_indices]
+        y_cal_meta = np.asarray(
+            [int(e["label"]) for e in cal_examples], dtype=np.int64
         )
-        splits = [(tr_idx, va_idx)]
-        print(f"[no-kfold] single holdout split: train={len(tr_idx)} val={len(va_idx)} (holdout_frac={holdout_frac:.2f})")
+        cal_chunks = [e["chunk"] for e in cal_examples]
+        cal_weights = np.where(
+            y_cal_meta == 0, float(args.human_weight_multiplier), 1.0
+        ).astype(np.float64)
+
+        oof = np.zeros((len(y_cal_meta), len(column_names)), dtype=np.float64)
+        for model_idx, (name, model_proto) in enumerate(base_specs):
+            model = _clone(model_proto)
+            _fit(model, x_train_sel, y_train, sample_weights)
+            base_proba = _proba_pos(model, x_cal)
+            oof[:, model_idx] = base_proba
+            print_chunk_score_diagnostics(
+                f"no-fold {name} cal",
+                y_cal_meta.tolist(),
+                base_proba.tolist(),
+            )
+        if sequence_enabled:
+            seq_model = _make_sequence_model(args)
+            seq_model.fit(
+                train_chunks,
+                y_train.tolist(),
+                sample_weight=sample_weights.tolist(),
+            )
+            seq_proba = seq_model.predict_proba(cal_chunks)[:, 1]
+            oof[:, len(base_specs)] = seq_proba
+            print_chunk_score_diagnostics(
+                "no-fold sequence cal",
+                y_cal_meta.tolist(),
+                seq_proba.tolist(),
+            )
+        fold_ap = float(average_precision_score(y_cal_meta, oof.mean(axis=1)))
+        fold_aps.append(fold_ap)
+        print(
+            f"[no-fold] trained on {len(y_train)} fit rows, "
+            f"cal={len(y_cal_meta)} rows, mean-base AP={fold_ap:.4f}"
+        )
+        # Keep original fit_examples data for the final refit below.
+        # Only swap y_train/sample_weights for meta-learner and calibration
+        # (meta_idx selects all cal rows which all have real predictions).
+        y_train_fit = y_train
+        sample_weights_fit = sample_weights
+        train_chunks_fit = train_chunks
+        x_train_sel_fit = x_train_sel
+        y_train = y_cal_meta
+        sample_weights = cal_weights
+        meta_idx = np.arange(len(y_cal_meta))
+
     else:
+        oof = np.zeros((len(y_train), len(column_names)), dtype=np.float64)
         kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
         splits = list(kfold.split(x_train_sel, y_train))
 
-    for fold_idx, (tr_idx, va_idx) in enumerate(splits):
-        fold_label = "holdout" if n_folds == 1 else f"fold {fold_idx + 1}/{n_folds}"
-        x_tr, x_va = x_train_sel[tr_idx], x_train_sel[va_idx]
-        y_tr = y_train[tr_idx]
-        w_tr = sample_weights[tr_idx]
-        for model_idx, (name, model_proto) in enumerate(base_specs):
-            model = _clone(model_proto)
-            _fit(model, x_tr, y_tr, w_tr)
-            base_proba = _proba_pos(model, x_va)
-            oof[va_idx, model_idx] = base_proba
-            if args.oof_learner_metrics:
-                print_chunk_score_diagnostics(
-                    f"{fold_label} {name} OOF",
-                    y_train[va_idx].tolist(),
-                    base_proba.tolist(),
+        for fold_idx, (tr_idx, va_idx) in enumerate(splits):
+            fold_label = f"fold {fold_idx + 1}/{n_folds}"
+            x_tr, x_va = x_train_sel[tr_idx], x_train_sel[va_idx]
+            y_tr = y_train[tr_idx]
+            w_tr = sample_weights[tr_idx]
+            for model_idx, (name, model_proto) in enumerate(base_specs):
+                model = _clone(model_proto)
+                _fit(model, x_tr, y_tr, w_tr)
+                base_proba = _proba_pos(model, x_va)
+                oof[va_idx, model_idx] = base_proba
+                if args.oof_learner_metrics:
+                    print_chunk_score_diagnostics(
+                        f"{fold_label} {name} OOF",
+                        y_train[va_idx].tolist(),
+                        base_proba.tolist(),
+                    )
+            if sequence_enabled:
+                seq_model = _make_sequence_model(args)
+                seq_train_chunks = [train_chunks[i] for i in tr_idx]
+                seq_model.fit(
+                    seq_train_chunks,
+                    y_tr.tolist(),
+                    sample_weight=w_tr.tolist(),
                 )
-        if sequence_enabled:
-            seq_model = _make_sequence_model(args)
-            seq_train_chunks = [train_chunks[i] for i in tr_idx]
-            seq_model.fit(
-                seq_train_chunks,
-                y_tr.tolist(),
-                sample_weight=w_tr.tolist(),
+                seq_proba = seq_model.predict_proba(
+                    [train_chunks[i] for i in va_idx]
+                )[:, 1]
+                oof[va_idx, len(base_specs)] = seq_proba
+                if args.oof_learner_metrics:
+                    print_chunk_score_diagnostics(
+                        f"{fold_label} sequence OOF",
+                        y_train[va_idx].tolist(),
+                        seq_proba.tolist(),
+                    )
+            fold_ap = float(
+                average_precision_score(y_train[va_idx], oof[va_idx].mean(axis=1))
             )
-            seq_proba = seq_model.predict_proba(
-                [train_chunks[i] for i in va_idx]
-            )[:, 1]
-            oof[va_idx, len(base_specs)] = seq_proba
-            if args.oof_learner_metrics:
-                print_chunk_score_diagnostics(
-                    f"{fold_label} sequence OOF",
-                    y_train[va_idx].tolist(),
-                    seq_proba.tolist(),
-                )
-        fold_ap = float(
-            average_precision_score(y_train[va_idx], oof[va_idx].mean(axis=1))
-        )
-        fold_aps.append(fold_ap)
-        print(f"  {fold_label} mean-base AP={fold_ap:.4f}")
+            fold_aps.append(fold_ap)
+            print(f"  {fold_label} mean-base AP={fold_ap:.4f}")
 
-    # Meta-learner on OOF base predictions.
+        meta_idx = np.arange(len(y_train))
     meta = LogisticRegression(
         C=float(args.meta_c),
         solver="lbfgs",
         max_iter=1000,
         class_weight=None,
     )
-    meta.fit(oof, y_train, sample_weight=sample_weights)
-    stacked_oof = np.asarray(meta.predict_proba(oof))[:, 1]
+    meta.fit(oof[meta_idx], y_train[meta_idx], sample_weight=sample_weights[meta_idx])
+    stacked_oof = np.asarray(meta.predict_proba(oof[meta_idx]))[:, 1]
     if float(args.meta_hard_bot_weight) > 0.0:
         hard_weights = _hard_bot_meta_weights(
-            sample_weights,
-            y_train,
+            sample_weights[meta_idx],
+            y_train[meta_idx],
             stacked_oof,
             hard_bot_weight=float(args.meta_hard_bot_weight),
             gamma=float(args.meta_hard_bot_gamma),
         )
-        meta.fit(oof, y_train, sample_weight=hard_weights)
-        stacked_oof = np.asarray(meta.predict_proba(oof))[:, 1]
-        bot_probs = stacked_oof[y_train == 1]
+        meta.fit(oof[meta_idx], y_train[meta_idx], sample_weight=hard_weights)
+        stacked_oof = np.asarray(meta.predict_proba(oof[meta_idx]))[:, 1]
+        bot_probs = stacked_oof[y_train[meta_idx] == 1]
         print(
             "Meta hard-bot focus: "
             f"weight={float(args.meta_hard_bot_weight):.2f} "
@@ -1374,9 +1429,9 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             f"bot_oof_q10={float(np.quantile(bot_probs, 0.10)) if bot_probs.size else 0.0:.4f} "
             f"bot_oof_q50={float(np.quantile(bot_probs, 0.50)) if bot_probs.size else 0.0:.4f}"
         )
-    oof_ap = float(average_precision_score(y_train, stacked_oof))
+    oof_ap = float(average_precision_score(y_train[meta_idx], stacked_oof))
     print(f"Stacked OOF AP={oof_ap:.4f} (mean-fold {np.mean(fold_aps):.4f})")
-    oof_raw_bounds = human_bot_prob_bounds(y_train.tolist(), stacked_oof.tolist())
+    oof_raw_bounds = human_bot_prob_bounds(y_train[meta_idx].tolist(), stacked_oof.tolist())
     print(
         "Stacked OOF score range: "
         f"raw=[{float(np.min(stacked_oof)):.4f}, {float(np.max(stacked_oof)):.4f}] "
@@ -1395,7 +1450,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         print(f"Calibrator: passthrough (OOF AP={oof_ap:.4f})")
     elif calibrator_mode == "isotonic":
         iso = IsotonicRegression(out_of_bounds="clip")
-        iso.fit(stacked_oof, y_train)
+        iso.fit(stacked_oof, y_train[meta_idx])
         stack_calibrator = iso
         calibrated_oof = np.asarray(iso.transform(stacked_oof), dtype=float)
         print(f"Calibrator: isotonic (OOF AP={oof_ap:.4f})")
@@ -1413,7 +1468,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         )
     else:
         raise RuntimeError(f"Unknown stack calibrator mode: {calibrator_mode}")
-    oof_cal_bounds = human_bot_prob_bounds(y_train.tolist(), calibrated_oof.tolist())
+    oof_cal_bounds = human_bot_prob_bounds(y_train[meta_idx].tolist(), calibrated_oof.tolist())
     print(
         "Stacked OOF calibrated range: "
         f"[{float(np.min(calibrated_oof)):.4f}, {float(np.max(calibrated_oof)):.4f}] "
@@ -1421,12 +1476,19 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         f"bot_prob_min={oof_cal_bounds['bot_prob_min']:.4f}"
     )
 
-    # Refit base models on the full training set.
+    # Refit base models on the full training set (fit_examples, not cal_examples).
+    # When n_folds=1, y_train/sample_weights were swapped to cal data for
+    # meta-learner calibration above — use the preserved _fit variables here.
+    _y_refit = y_train_fit if n_folds == 1 else y_train
+    _w_refit = sample_weights_fit if n_folds == 1 else sample_weights
+    _x_refit = x_train_sel_fit if n_folds == 1 else x_train_sel
+    _chunks_refit = train_chunks_fit if n_folds == 1 else train_chunks
+
     base_models: List[Any] = []
     base_names: List[str] = []
     for name, model_proto in base_specs:
         model = _clone(model_proto)
-        _fit(model, x_train_sel, y_train, sample_weights)
+        _fit(model, _x_refit, _y_refit, _w_refit)
         base_models.append(model)
         base_names.append(name)
 
@@ -1448,17 +1510,17 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
                 f"{[round(lr, 6) for lr in epoch_lrs]}"
             )
         final_seq_model.fit(
-            train_chunks,
-            y_train.tolist(),
-            sample_weight=sample_weights.tolist(),
+            _chunks_refit,
+            _y_refit.tolist(),
+            sample_weight=_w_refit.tolist(),
         )
         chunk_models.append(final_seq_model)
         chunk_names.append("sequence")
         if args.sequence_verbose_metrics:
-            seq_train_proba = final_seq_model.predict_proba(train_chunks)[:, 1]
+            seq_train_proba = final_seq_model.predict_proba(_chunks_refit)[:, 1]
             print_chunk_score_diagnostics(
                 "sequence final fit (full train)",
-                y_train.tolist(),
+                _y_refit.tolist(),
                 seq_train_proba.tolist(),
             )
 
@@ -1544,7 +1606,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     if not args.no_score_logit_tune:
         score_logit_bias, score_logit_temperature, logit_cal_metrics = (
             _select_score_logit_for_validator_reward(
-                y_train,
+                y_train[meta_idx],
                 oof_for_logit,
                 target_fpr=float(args.target_fpr),
                 max_validator_fpr=float(args.max_validator_fpr),
