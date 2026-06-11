@@ -726,12 +726,25 @@ def parse_learning_rate_schedule(
     default_lr: float,
     n_epochs: int,
 ) -> list[float]:
-    """Expand ``lr:epochs`` segments into one LR per training epoch.
+    """Expand schedule segments into one LR per training epoch.
 
-    Example: ``"1.3e-3:4,1e-3:4"`` with ``n_epochs=8`` -> eight rates.
+    Two segment formats are supported:
+
+    * ``lr:epochs``  — constant rate for N epochs.
+      Example: ``"1.3e-3:4,1e-3:4"`` -> [1.3e-3]*4 + [1e-3]*4
+
+    * ``cosine:lr_max:lr_min:epochs``  — cosine annealing over N epochs,
+      smoothly decaying from lr_max down to lr_min.
+      Example: ``"cosine:1.5e-3:3e-4:20"`` with n_epochs=20
+               -> 20 values from 1.5e-3 to 3e-4 following a cosine curve.
+
+    Segments can be mixed:  ``"1.5e-3:2,cosine:1.5e-3:3e-4:18"``
+
     If the schedule defines fewer epochs than ``n_epochs``, the last rate is
-    repeated. If it defines more, it is truncated to ``n_epochs``.
+    repeated.  If it defines more, it is truncated to ``n_epochs``.
     """
+    import math
+
     total_epochs = max(1, int(n_epochs))
     fallback = float(default_lr)
     if fallback <= 0:
@@ -748,16 +761,38 @@ def parse_learning_rate_schedule(
         if ":" not in segment:
             raise ValueError(
                 f"Invalid learning-rate schedule segment {segment!r}; "
-                "use lr:epochs (e.g. 1.3e-3:4,1e-3:4)."
+                "use lr:epochs or cosine:lr_max:lr_min:epochs."
             )
-        lr_text, count_text = segment.rsplit(":", 1)
-        lr = float(lr_text.strip())
-        count = int(count_text.strip())
-        if lr <= 0:
-            raise ValueError(f"Learning rate must be positive, got {lr!r}")
-        if count <= 0:
-            raise ValueError(f"Epoch count must be positive, got {count!r}")
-        per_epoch.extend([lr] * count)
+        if segment.lower().startswith("cosine:"):
+            # cosine:lr_max:lr_min:epochs
+            parts = segment.split(":")
+            if len(parts) != 4:
+                raise ValueError(
+                    f"cosine segment must be cosine:lr_max:lr_min:epochs, got {segment!r}"
+                )
+            lr_max = float(parts[1].strip())
+            lr_min = float(parts[2].strip())
+            count = int(parts[3].strip())
+            if lr_max <= 0 or lr_min < 0:
+                raise ValueError(
+                    f"cosine lr_max must be > 0 and lr_min >= 0, got {lr_max}, {lr_min}"
+                )
+            if count <= 0:
+                raise ValueError(f"Epoch count must be positive, got {count!r}")
+            for i in range(count):
+                # cosine annealing: lr = lr_min + 0.5*(lr_max-lr_min)*(1+cos(pi*i/(count-1)))
+                t = i / max(count - 1, 1)
+                lr = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.pi * t))
+                per_epoch.append(lr)
+        else:
+            lr_text, count_text = segment.rsplit(":", 1)
+            lr = float(lr_text.strip())
+            count = int(count_text.strip())
+            if lr <= 0:
+                raise ValueError(f"Learning rate must be positive, got {lr!r}")
+            if count <= 0:
+                raise ValueError(f"Epoch count must be positive, got {count!r}")
+            per_epoch.extend([lr] * count)
 
     if not per_epoch:
         return [fallback] * total_epochs
