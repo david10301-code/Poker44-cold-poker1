@@ -1598,7 +1598,13 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         print("score_remap disabled (--no-score-remap).")
 
+    # Match the inference order (calibrator -> remap -> logit): the logit tune
+    # must see the SAME remapped scores the bias/temperature will be applied to
+    # at scoring time. Without this, the bias is tuned on calibrated-but-not-
+    # remapped scores and applied post-remap, leaving it slightly off-target.
     oof_for_logit = calibrated_oof
+    if score_remap and use_score_remap:
+        oof_for_logit = _apply_score_remap_np(calibrated_oof, score_remap)
 
     score_logit_bias = 0.0
     score_logit_temperature = 1.0
