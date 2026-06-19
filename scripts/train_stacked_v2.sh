@@ -103,7 +103,7 @@ fi
 if [[ "$NO_SCORE_REMAP" == "1" ]]; then
   EXTRA_ARGS+=(--no-score-remap)
 else
-  EXTRA_ARGS+=(--score-remap-temperature-grid "${SCORE_REMAP_TEMPERATURE_GRID:-0.06,0.08,0.10,0.12,0.18,0.25,0.35,0.50,0.65,0.85,1.0,1.25,1.50,1.75,2.0}")
+  EXTRA_ARGS+=(--score-remap-temperature-grid "${SCORE_REMAP_TEMPERATURE_GRID:-0.08,0.10,0.12,0.18,0.25,0.35,0.50,0.65,0.85,1.0}")
 fi
 if [[ "${NO_SCORE_REMAP_PREFER_SMOOTH:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--no-score-remap-prefer-smooth)
