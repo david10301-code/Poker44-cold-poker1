@@ -73,6 +73,7 @@ def _diagnose(record: Dict[str, Any], index: int) -> None:
     preds = list(record.get("predictions") or [])
     components = record.get("components") or {}
     raw = list(components.get("raw_scores") or [])
+    calibrated = list(components.get("calibrated_scores") or [])
     remapped = list(components.get("remapped_scores") or [])
     final_components = list(
         components.get("final_scores") or components.get("logit_scores") or []
@@ -88,9 +89,16 @@ def _diagnose(record: Dict[str, Any], index: int) -> None:
     )
     if raw:
         print(_summarize("raw         ", raw))
-    if remapped and remapped != raw:
+    if calibrated and calibrated != raw:
+        print(_summarize("stack_calib ", calibrated))
+    if remapped and remapped != calibrated and remapped != raw:
         print(_summarize("score_remap ", remapped))
-    if final_components and final_components != remapped and final_components != raw:
+    if (
+        final_components
+        and final_components != remapped
+        and final_components != calibrated
+        and final_components != raw
+    ):
         print(_summarize("final_comp  ", final_components))
     if risk:
         print(_summarize("risk_out    ", risk))

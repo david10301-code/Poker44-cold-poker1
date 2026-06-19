@@ -624,7 +624,7 @@ class Miner(BaseMinerNeuron):
             )
         if component_debug:
             for name, values in component_debug.items():
-                if name == "calibrated_scores" or not values:
+                if not values:
                     continue
                 message += (
                     f" {name}_range="
@@ -645,7 +645,6 @@ class Miner(BaseMinerNeuron):
                 score_payload["components"] = {
                     name: [round(float(value), score_log_decimals) for value in values]
                     for name, values in component_debug.items()
-                    if name != "calibrated_scores"
                 }
             bt.logging.info(f"Detailed chunk scores | {score_payload}")
         bt.logging.success(

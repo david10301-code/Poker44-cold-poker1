@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 import time
 import warnings
@@ -90,51 +91,136 @@ class Poker44Model:
             rows.append([float(features.get(name, 0.0)) for name in self.feature_names])
         return rows
 
+    def _model_column(
+        self,
+        model: Any,
+        rows: list[list[float]],
+        chunks: list[list[dict[str, Any]]] | None,
+        apply_calibration: bool,
+    ) -> list[float]:
+        """Score ONE base model into a per-row column.
+
+        Single source of truth for per-model dispatch, shared by
+        ``_raw_model_scores`` and ``_raw_model_score_stages`` so they cannot
+        drift. ``apply_calibration`` is forwarded only to learners whose
+        ``predict_chunk_scores`` accepts it (stacked learners); the probe order
+        degrades gracefully for every other signature.
+        """
+        if (
+            chunks is not None
+            and hasattr(model, "predict_chunk_scores")
+            and not isinstance(model, type(self))
+        ):
+            for call_kwargs in (
+                {"feature_rows": rows, "apply_calibration": apply_calibration},
+                {"feature_rows": rows},
+                {"apply_calibration": apply_calibration},
+                {},
+            ):
+                try:
+                    raw = model.predict_chunk_scores(chunks, **call_kwargs)
+                    return [self._clamp01(float(value)) for value in raw]
+                except TypeError:
+                    continue
+        if hasattr(model, "predict_proba"):
+            return [self._clamp01(row[1]) for row in model.predict_proba(rows)]
+        if hasattr(model, "decision_function"):
+            return [self._sigmoid(value) for value in model.decision_function(rows)]
+        return [self._clamp01(value) for value in model.predict(rows)]
+
+    @staticmethod
+    def _accepts_apply_calibration(fn: Any) -> bool:
+        """True if ``fn`` declares an ``apply_calibration`` parameter."""
+        try:
+            return "apply_calibration" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
+
     def _raw_model_scores(
         self,
         rows: list[list[float]],
         chunks: list[list[dict[str, Any]]] | None = None,
+        *,
+        apply_calibration: bool = True,
     ) -> list[float]:
-        per_model: list[list[float]] = []
-        for model in self.models:
-            if (
-                chunks is not None
-                and hasattr(model, "predict_chunk_scores")
-                and not isinstance(model, type(self))
-            ):
-                try:
-                    raw = model.predict_chunk_scores(chunks, feature_rows=rows)
-                    per_model.append([self._clamp01(float(value)) for value in raw])
-                    continue
-                except TypeError:
-                    try:
-                        raw = model.predict_chunk_scores(chunks)
-                        per_model.append([self._clamp01(float(value)) for value in raw])
-                        continue
-                    except TypeError:
-                        pass
-            if hasattr(model, "predict_proba"):
-                probabilities = model.predict_proba(rows)
-                per_model.append([self._clamp01(row[1]) for row in probabilities])
-            elif hasattr(model, "decision_function"):
-                decisions = model.decision_function(rows)
-                per_model.append([self._sigmoid(value) for value in decisions])
-            else:
-                per_model.append([self._clamp01(value) for value in model.predict(rows)])
+        per_model = [
+            self._model_column(model, rows, chunks, apply_calibration)
+            for model in self.models
+        ]
+        return self._blend_per_model(per_model, len(rows))
 
+    def _blend_per_model(
+        self, per_model: list[list[float]], n_rows: int
+    ) -> list[float]:
+        """Weighted-mean blend of per-model score columns."""
         weights = [max(0.0, float(value)) for value in self.model_weights[: len(per_model)]]
         if len(weights) != len(per_model) or sum(weights) <= 0.0:
             weights = [1.0 for _ in per_model]
         total_weight = sum(weights)
 
         scores: list[float] = []
-        for row_index in range(len(rows)):
+        for row_index in range(n_rows):
             value = sum(
                 weight * model_scores[row_index]
                 for weight, model_scores in zip(weights, per_model)
             ) / total_weight
             scores.append(self._clamp01(value))
         return scores
+
+    def _raw_model_score_stages(
+        self,
+        rows: list[list[float]],
+        chunks: list[list[dict[str, Any]]] | None = None,
+    ) -> tuple[list[float], list[float]]:
+        """Blended (pre-calibration, calibrated) scores from ONE base pass per model.
+
+        Correct-by-construction equal to ``(_raw_model_scores(apply_calibration=
+        False), _raw_model_scores(apply_calibration=True))``: a stacked learner
+        returns both meta-head stages from a SINGLE base pass via
+        ``predict_chunk_score_stages``; a learner whose ``predict_chunk_scores``
+        is calibration-aware but lacks that method is scored twice (it cannot
+        single-pass); every other learner has no internal calibrator, so its two
+        stages are one column (single pass).
+        """
+        per_model_precal: list[list[float]] = []
+        per_model_cal: list[list[float]] = []
+        for model in self.models:
+            precal: list[float] | None = None
+            cal: list[float] | None = None
+            # Fast path: one base pass yields both stages.
+            if (
+                chunks is not None
+                and not isinstance(model, type(self))
+                and hasattr(model, "predict_chunk_score_stages")
+            ):
+                try:
+                    p, c = model.predict_chunk_score_stages(chunks, feature_rows=rows)
+                    precal = [self._clamp01(float(v)) for v in p]
+                    cal = [self._clamp01(float(v)) for v in c]
+                except TypeError:
+                    precal = cal = None
+            if cal is None:
+                cal = self._model_column(model, rows, chunks, apply_calibration=True)
+                if (
+                    chunks is not None
+                    and not isinstance(model, type(self))
+                    and hasattr(model, "predict_chunk_scores")
+                    and self._accepts_apply_calibration(model.predict_chunk_scores)
+                ):
+                    # Calibration-aware but no single-pass stages: the
+                    # pre-calibration column needs its own pass.
+                    precal = self._model_column(
+                        model, rows, chunks, apply_calibration=False
+                    )
+                else:
+                    # No internal calibrator -> both stages are identical.
+                    precal = cal
+            per_model_precal.append(precal)
+            per_model_cal.append(cal)
+        return (
+            self._blend_per_model(per_model_precal, len(rows)),
+            self._blend_per_model(per_model_cal, len(rows)),
+        )
 
     def _apply_calibrator(self, scores: list[float]) -> list[float]:
         if not scores or self.calibrator is None:
@@ -201,12 +287,23 @@ class Poker44Model:
         if not chunks:
             return {}
         rows = self._aligned_rows(chunks)
-        raw_scores = self._raw_model_scores(rows, chunks=chunks)
-        calibrated_scores = self._apply_calibrator(raw_scores)
+        # Diagnostic-only path (gated by POKER44_LOG_SCORE_COMPONENTS). The
+        # submitted score in predict_chunk_scores is unchanged.
+        #   raw_scores        = pre-calibration stacked (meta) score
+        #   calibrated_scores = + stack calibrator (isotonic, internal to a
+        #                         stacked artifact)
+        #   remapped_scores   = + score_remap
+        #   final_scores      = + score_logit  (what the validator rounds at 0.5)
+        # Both stages come from a SINGLE base pass (no double scoring).
+        precal_scores, internal_calibrated = self._raw_model_score_stages(
+            rows, chunks=chunks
+        )
+        calibrated_scores = self._apply_calibrator(internal_calibrated)
         remapped_scores = self._apply_score_remap(calibrated_scores)
         logit_scores = self._apply_score_logit(remapped_scores)
         return {
-            "raw_scores": self._round_score_log_values(raw_scores),
+            "raw_scores": self._round_score_log_values(precal_scores),
+            "calibrated_scores": self._round_score_log_values(calibrated_scores),
             "remapped_scores": self._round_score_log_values(remapped_scores),
             "final_scores": self._round_score_log_values(logit_scores),
         }

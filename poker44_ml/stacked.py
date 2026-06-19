@@ -115,9 +115,15 @@ class StackedEnsemble:
         x_sel = self._select_features(x_arr)
         return self._base_probs(x_sel)
 
-    def _meta_to_output(self, z: np.ndarray) -> np.ndarray:
+    def _meta_to_output(
+        self, z: np.ndarray, *, apply_calibration: bool = True
+    ) -> np.ndarray:
         meta_proba = np.asarray(self.meta_model.predict_proba(z))
         p1 = meta_proba[:, 1] if meta_proba.ndim == 2 else meta_proba
+        if not apply_calibration:
+            # Pre-calibration stacked score: meta blend only, before the stack
+            # calibrator (e.g. isotonic) and the conformal score_shift.
+            return np.clip(p1, 0.0, 1.0)
         if self.calibrator is not None:
             if hasattr(self.calibrator, "transform"):
                 p1 = np.asarray(self.calibrator.transform(p1), dtype=float)
@@ -127,7 +133,7 @@ class StackedEnsemble:
             p1 = self._logit_shift(p1, self.score_shift)
         return np.clip(p1, 0.0, 1.0)
 
-    def predict_proba(self, x: Any) -> np.ndarray:
+    def predict_proba(self, x: Any, *, apply_calibration: bool = True) -> np.ndarray:
         if self.chunk_models:
             raise RuntimeError(
                 "StackedEnsemble has chunk-based learners; use "
@@ -136,20 +142,13 @@ class StackedEnsemble:
         x_arr = np.asarray(x, dtype=np.float64)
         x_sel = self._select_features(x_arr)
         z = self._base_probs(x_sel)
-        p1 = self._meta_to_output(z)
+        p1 = self._meta_to_output(z, apply_calibration=apply_calibration)
         return np.stack([1.0 - p1, p1], axis=1)
 
-    def predict_chunk_scores(
-        self,
-        chunks: Sequence[Any],
-        feature_rows: Any,
-    ) -> List[float]:
-        """Score raw chunks using pre-computed feature rows.
-
-        ``feature_rows`` must be an iterable of feature lists already aligned
-        with the artifact's ``feature_names`` ordering (the canonical
-        Poker44Model loader supplies these via ``_aligned_rows``).
-        """
+    def _stacked_feature_matrix(
+        self, chunks: Sequence[Any], feature_rows: Any
+    ) -> np.ndarray:
+        """Base-learner prediction matrix (the expensive forward pass)."""
         x_arr = np.asarray(feature_rows, dtype=np.float64)
         x_sel = self._select_features(x_arr)
         if self.base_models:
@@ -160,13 +159,41 @@ class StackedEnsemble:
         if feature_probs.size == 0 and chunk_probs.size == 0:
             raise RuntimeError("No base or chunk models are available for scoring.")
         if chunk_probs.size == 0:
-            stacked = feature_probs
-        elif feature_probs.size == 0:
-            stacked = chunk_probs
-        else:
-            stacked = np.concatenate([feature_probs, chunk_probs], axis=1)
-        p1 = self._meta_to_output(stacked)
+            return feature_probs
+        if feature_probs.size == 0:
+            return chunk_probs
+        return np.concatenate([feature_probs, chunk_probs], axis=1)
+
+    def predict_chunk_scores(
+        self,
+        chunks: Sequence[Any],
+        feature_rows: Any,
+        *,
+        apply_calibration: bool = True,
+    ) -> List[float]:
+        """Score raw chunks using pre-computed feature rows.
+
+        ``feature_rows`` must be an iterable of feature lists already aligned
+        with the artifact's ``feature_names`` ordering (the canonical
+        Poker44Model loader supplies these via ``_aligned_rows``).
+        """
+        stacked = self._stacked_feature_matrix(chunks, feature_rows)
+        p1 = self._meta_to_output(stacked, apply_calibration=apply_calibration)
         return [float(value) for value in p1]
+
+    def predict_chunk_score_stages(
+        self, chunks: Sequence[Any], feature_rows: Any
+    ) -> tuple[List[float], List[float]]:
+        """Pre-calibration and calibrated chunk scores from ONE base pass.
+
+        Returns ``(precalibration, calibrated)``. The expensive base/chunk
+        forward pass runs once; only the cheap meta head is applied twice.
+        Used by diagnostics to log both stages without re-scoring.
+        """
+        stacked = self._stacked_feature_matrix(chunks, feature_rows)
+        precal = self._meta_to_output(stacked, apply_calibration=False)
+        calibrated = self._meta_to_output(stacked, apply_calibration=True)
+        return [float(v) for v in precal], [float(v) for v in calibrated]
 
     def predict(self, x: Any) -> np.ndarray:
         proba = self.predict_proba(x)[:, 1]

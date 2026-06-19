@@ -1,3 +1,12 @@
+"""Backward-compatibility shim.
+
+The quantile stack calibrator has been removed from the training pipeline
+(``training/train_model_v2.py`` now uses isotonic/passthrough). This class is
+retained ONLY so that previously-saved ``.joblib`` artifacts that pickled a
+``BlendedQuantileCalibrator`` inside their ``StackedEnsemble`` can still be
+unpickled and scored. Do not wire it into new training code.
+"""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -7,7 +16,11 @@ from sklearn.preprocessing import QuantileTransformer
 
 
 class BlendedQuantileCalibrator:
-    """Monotone score spreader for collapsed stacked probabilities."""
+    """Monotone score spreader for collapsed stacked probabilities.
+
+    Deprecated/unused: kept only for unpickling legacy saved models. See the
+    module docstring.
+    """
 
     def __init__(self, blend: float = 0.9, max_quantiles: int = 256) -> None:
         self.blend = float(max(0.0, min(1.0, blend)))

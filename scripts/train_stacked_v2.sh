@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Train the v2 stacked Poker44 model for live validator reward.
 #
-# Default: AP-first calibration (ranking quality), quantile stack calibrator
-# for wider score support, score_remap enabled, and no post-remap logit shift.
+# Default: AP-first calibration (ranking quality), isotonic stack calibrator,
+# score_remap enabled, and no post-remap logit shift.
 # Leaderboard pattern: high AP + low recall + FPR << 10% -> reward ~0.55-0.60.
 #
 # Usage:
@@ -33,8 +33,7 @@ EXCLUDE_TRAIN_SOURCE_DATES="${EXCLUDE_TRAIN_SOURCE_DATES:-}"
 TARGET_FPR="${TARGET_FPR:-0.04}"
 MAX_VALIDATOR_FPR="${MAX_VALIDATOR_FPR:-0.05}"
 CALIBRATION_OBJECTIVE="${CALIBRATION_OBJECTIVE:-ap_first}"
-STACK_CALIBRATOR="${STACK_CALIBRATOR:-quantile}"
-QUANTILE_CALIBRATION_BLEND="${QUANTILE_CALIBRATION_BLEND:-0.9}"
+STACK_CALIBRATOR="${STACK_CALIBRATOR:-isotonic}"
 HUMAN_WEIGHT="${HUMAN_WEIGHT:-1.3}"
 META_C="${META_C:-1.0}"
 N_FOLDS="${N_FOLDS:-5}"          # set to 1 for single holdout split (no k-fold)
@@ -113,7 +112,6 @@ if [[ "$NO_SCORE_LOGIT_TUNE" == "1" ]]; then
 fi
 EXTRA_ARGS+=(--calibration-objective "$CALIBRATION_OBJECTIVE")
 EXTRA_ARGS+=(--stack-calibrator "$STACK_CALIBRATOR")
-EXTRA_ARGS+=(--quantile-calibration-blend "$QUANTILE_CALIBRATION_BLEND")
 
 mkdir -p "$(dirname "$OUTPUT")" logs
 

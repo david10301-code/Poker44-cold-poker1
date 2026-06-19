@@ -51,7 +51,6 @@ from poker44_ml.chunk_score_metrics import (
     print_chunk_score_diagnostics,
 )
 from poker44.utils.model_manifest import artifact_model_identity
-from poker44_ml.calibration import BlendedQuantileCalibrator
 from poker44_ml.inference import Poker44Model
 from poker44_ml.stacked import StackedEnsemble
 from training.build_dataset import (
@@ -179,20 +178,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stack-calibrator",
         type=str,
-        choices=("auto", "passthrough", "isotonic", "quantile"),
-        default="quantile",
+        choices=("auto", "passthrough", "isotonic"),
+        default="isotonic",
         help=(
-            "Post-stack calibrator family. quantile spreads scores across [0,1] "
-            "monotonically and is more robust when raw stack scores are collapsed."
-        ),
-    )
-    parser.add_argument(
-        "--quantile-calibration-blend",
-        type=float,
-        default=0.9,
-        help=(
-            "Blend between quantile-uniform transform and identity for stack "
-            "calibration (1.0 = fully uniformized, 0.0 = passthrough)."
+            "Post-stack calibrator family. isotonic fits a monotonic recalibration "
+            "on OOF stacked scores; passthrough applies none. (The legacy quantile "
+            "calibrator has been removed.)"
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -1442,7 +1433,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     # Calibration on OOF stacked scores.
     calibrator_mode = str(args.stack_calibrator).strip().lower()
     if calibrator_mode == "auto":
-        calibrator_mode = "quantile" if oof_ap >= 0.99 else "isotonic"
+        calibrator_mode = "isotonic"
 
     stack_calibrator: Optional[Any] = None
     if calibrator_mode == "passthrough":
@@ -1454,18 +1445,6 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         stack_calibrator = iso
         calibrated_oof = np.asarray(iso.transform(stacked_oof), dtype=float)
         print(f"Calibrator: isotonic (OOF AP={oof_ap:.4f})")
-    elif calibrator_mode == "quantile":
-        quantile_cal = BlendedQuantileCalibrator(
-            blend=float(args.quantile_calibration_blend),
-            max_quantiles=256,
-        )
-        quantile_cal.fit(stacked_oof)
-        stack_calibrator = quantile_cal
-        calibrated_oof = np.asarray(quantile_cal.transform(stacked_oof), dtype=float)
-        print(
-            "Calibrator: quantile "
-            f"(OOF AP={oof_ap:.4f}, blend={float(args.quantile_calibration_blend):.2f})"
-        )
     else:
         raise RuntimeError(f"Unknown stack calibrator mode: {calibrator_mode}")
     oof_cal_bounds = human_bot_prob_bounds(y_train[meta_idx].tolist(), calibrated_oof.tolist())
@@ -1534,17 +1513,20 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         chunk_models=chunk_models,
     )
 
-    def _stacked_raw_scores(examples: List[Dict[str, Any]]) -> np.ndarray:
+    def _stacked_raw_scores(
+        examples: List[Dict[str, Any]], *, calibrated: bool = True
+    ) -> np.ndarray:
         x_rows = _build_matrix(examples, feature_names)[:, feature_indices]
         if chunk_models:
             return np.asarray(
                 stacked.predict_chunk_scores(
                     [example["chunk"] for example in examples],
                     feature_rows=x_rows,
+                    apply_calibration=calibrated,
                 ),
                 dtype=float,
             )
-        return stacked.predict_proba(x_rows)[:, 1]
+        return stacked.predict_proba(x_rows, apply_calibration=calibrated)[:, 1]
 
     cal_objective = str(args.calibration_objective)
     use_score_remap = not bool(args.no_score_remap)
@@ -1633,15 +1615,21 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             f"oof_bot_prob_min={logit_cal_metrics.get('bot_prob_min', 0.0):.4f}"
         )
 
-    test_raw = _stacked_raw_scores(test_examples)
-    test_mid = test_raw
+    # Explicit pipeline stages for logging:
+    #   test_precal     = base -> meta, BEFORE any calibration (raw stacked score)
+    #   test_calibrated = + stack (isotonic) calibrator      [input to remap/logit]
+    #   test_mid        = + score_remap
+    #   test_final      = + score_logit  (the score the validator rounds at 0.5)
+    test_precal = _stacked_raw_scores(test_examples, calibrated=False)
+    test_calibrated = _stacked_raw_scores(test_examples)
+    test_mid = test_calibrated
     if score_remap and use_score_remap:
-        test_mid = _apply_score_remap_np(test_raw, score_remap)
+        test_mid = _apply_score_remap_np(test_calibrated, score_remap)
     test_final = _logit_shift(
         test_mid, score_logit_bias, score_logit_temperature
     )
-    raw_humans = test_raw[y_test == 0]
-    raw_bots = test_raw[y_test == 1]
+    raw_humans = test_precal[y_test == 0]
+    raw_bots = test_precal[y_test == 1]
     raw_separation = (
         float(np.quantile(raw_bots, 0.10) - np.quantile(raw_humans, 0.90))
         if raw_humans.size and raw_bots.size
@@ -1650,7 +1638,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     test_metrics = _enrich_metrics(
         y_test.tolist(),
         test_final.tolist(),
-        raw_scores=test_raw.tolist(),
+        raw_scores=test_precal.tolist(),
     )
     remap_bounds: Dict[str, float] = {}
     if score_remap and use_score_remap:
@@ -1673,10 +1661,11 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         f"validator_reward={best['reward']:.4f} "
         f"validator_fpr={best['metrics'].get('validator_fpr', 0.0):.4f} "
         f"validator_bot_recall={best['metrics'].get('validator_bot_recall', 0.0):.4f} "
-        f"raw_range=[{float(np.min(test_raw)):.4f}, {float(np.max(test_raw)):.4f}] "
+        f"raw_range=[{float(np.min(test_precal)):.4f}, {float(np.max(test_precal)):.4f}] "
         f"raw_human_prob_max={best['metrics'].get('raw_human_prob_max', 0.0):.4f} "
         f"raw_bot_prob_min={best['metrics'].get('raw_bot_prob_min', 1.0):.4f}"
         f"{holdout_remap_line} "
+        f"calibrated_range=[{float(np.min(test_calibrated)):.4f}, {float(np.max(test_calibrated)):.4f}] "
         f"post_remap_range=[{float(np.min(test_mid)):.4f}, {float(np.max(test_mid)):.4f}] "
         f"final_range=[{float(np.min(test_final)):.4f}, {float(np.max(test_final)):.4f}] "
         f"raw_separation_q90_q10={raw_separation:.4f} "
@@ -1717,7 +1706,6 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         "max_validator_fpr": float(args.max_validator_fpr),
         "calibration_objective": cal_objective,
         "stack_calibrator": str(calibrator_mode),
-        "quantile_calibration_blend": float(args.quantile_calibration_blend),
         "calibration_fraction": float(args.calibration_fraction),
         "calibration_rows": float(len(cal_examples)),
         "miner_visible_payload": bool(miner_visible),
@@ -1778,11 +1766,14 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     loaded = Poker44Model(output_path)
     test_chunks = [example["chunk"] for example in test_examples]
     rt_scores = loaded.predict_chunk_scores(test_chunks)
-    rt_debug = loaded.debug_score_components(test_chunks)
+    # raw_scores here = pre-calibration stacked score (consistent with the
+    # holdout log). The inference debug 'raw_scores' is post stack-calibration
+    # because the stack calibrator lives inside the saved StackedEnsemble, so we
+    # reuse the training-side pre-calibration score (identical model, same order).
     rt_metrics = _enrich_metrics(
         y_test.tolist(),
         rt_scores,
-        raw_scores=rt_debug.get("raw_scores"),
+        raw_scores=test_precal.tolist(),
     )
     rt_metrics["latency_per_chunk_ms"] = loaded.benchmark_latency(
         [example["chunk"] for example in test_examples[:4]]
