@@ -34,6 +34,7 @@ TARGET_FPR="${TARGET_FPR:-0.04}"
 MAX_VALIDATOR_FPR="${MAX_VALIDATOR_FPR:-0.05}"
 CALIBRATION_OBJECTIVE="${CALIBRATION_OBJECTIVE:-ap_first}"
 STACK_CALIBRATOR="${STACK_CALIBRATOR:-isotonic}"
+ISOTONIC_CALIBRATION_BLEND="${ISOTONIC_CALIBRATION_BLEND:-0.5}"
 HUMAN_WEIGHT="${HUMAN_WEIGHT:-1.3}"
 META_C="${META_C:-1.0}"
 N_FOLDS="${N_FOLDS:-5}"          # set to 1 for single holdout split (no k-fold)
@@ -112,6 +113,7 @@ if [[ "$NO_SCORE_LOGIT_TUNE" == "1" ]]; then
 fi
 EXTRA_ARGS+=(--calibration-objective "$CALIBRATION_OBJECTIVE")
 EXTRA_ARGS+=(--stack-calibrator "$STACK_CALIBRATOR")
+EXTRA_ARGS+=(--isotonic-calibration-blend "$ISOTONIC_CALIBRATION_BLEND")
 
 mkdir -p "$(dirname "$OUTPUT")" logs
 

@@ -51,6 +51,7 @@ from poker44_ml.chunk_score_metrics import (
     print_chunk_score_diagnostics,
 )
 from poker44.utils.model_manifest import artifact_model_identity
+from poker44_ml.calibration import BlendedIsotonicCalibrator
 from poker44_ml.inference import Poker44Model
 from poker44_ml.stacked import StackedEnsemble
 from training.build_dataset import (
@@ -65,7 +66,6 @@ except ImportError as exc:  # pragma: no cover
     raise RuntimeError("joblib is required to train Poker44 models.") from exc
 
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
-from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
@@ -184,6 +184,17 @@ def parse_args() -> argparse.Namespace:
             "Post-stack calibrator family. isotonic fits a monotonic recalibration "
             "on OOF stacked scores; passthrough applies none. (The legacy quantile "
             "calibrator has been removed.)"
+        ),
+    )
+    parser.add_argument(
+        "--isotonic-calibration-blend",
+        type=float,
+        default=0.5,
+        help=(
+            "Dulling for the isotonic stack calibrator: "
+            "out = blend*isotonic(raw) + (1-blend)*raw. 1.0 = pure (sharp, "
+            "step-shaped) isotonic; lower = duller/smoother (preserves ranking "
+            "resolution); 0.0 = passthrough. Default 0.5."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -884,7 +895,7 @@ def _passes_calibration_constraints(
 ) -> bool:
     if metrics.get("validator_fpr", 1.0) >= max_validator_fpr - 1e-9:
         return False
-    if metrics.get("human_prob_max", 1.0) > 0.48:
+    if metrics.get("human_prob_max", 1.0) > 0.495:
         return False
     return True
 
@@ -1440,11 +1451,14 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         calibrated_oof = stacked_oof.copy()
         print(f"Calibrator: passthrough (OOF AP={oof_ap:.4f})")
     elif calibrator_mode == "isotonic":
-        iso = IsotonicRegression(out_of_bounds="clip")
+        iso = BlendedIsotonicCalibrator(blend=float(args.isotonic_calibration_blend))
         iso.fit(stacked_oof, y_train[meta_idx])
         stack_calibrator = iso
         calibrated_oof = np.asarray(iso.transform(stacked_oof), dtype=float)
-        print(f"Calibrator: isotonic (OOF AP={oof_ap:.4f})")
+        print(
+            "Calibrator: isotonic "
+            f"(OOF AP={oof_ap:.4f}, blend={float(args.isotonic_calibration_blend):.2f})"
+        )
     else:
         raise RuntimeError(f"Unknown stack calibrator mode: {calibrator_mode}")
     oof_cal_bounds = human_bot_prob_bounds(y_train[meta_idx].tolist(), calibrated_oof.tolist())
@@ -1706,6 +1720,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         "max_validator_fpr": float(args.max_validator_fpr),
         "calibration_objective": cal_objective,
         "stack_calibrator": str(calibrator_mode),
+        "isotonic_calibration_blend": float(args.isotonic_calibration_blend),
         "calibration_fraction": float(args.calibration_fraction),
         "calibration_rows": float(len(cal_examples)),
         "miner_visible_payload": bool(miner_visible),
