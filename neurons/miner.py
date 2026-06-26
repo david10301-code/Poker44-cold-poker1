@@ -79,6 +79,20 @@ class Miner(BaseMinerNeuron):
             os.getenv("POKER44_LOG_SCORE_ARRAYS", "1").strip().lower()
             in {"1", "true", "yes", "on"}
         )
+        # Optional, model-EXTERNAL bot-count budget (OFF by default). Caps how
+        # many chunks per batch may be flagged bot, controlled purely by env
+        # flags -- never baked into the model artifact. Enabled iff a positive
+        # max-count or max-fraction is set.
+        _budget_count = int(os.getenv("POKER44_BOT_BUDGET_MAX_COUNT", "0") or 0)
+        _budget_fraction = float(os.getenv("POKER44_BOT_BUDGET_MAX_FRACTION", "0") or 0.0)
+        self.bot_budget = {
+            "enabled": _budget_count > 0 or _budget_fraction > 0.0,
+            "max_count": _budget_count,
+            "max_fraction": _budget_fraction,
+            "positive_floor": float(os.getenv("POKER44_BOT_BUDGET_POSITIVE_FLOOR", "0.501")),
+            "positive_ceiling": float(os.getenv("POKER44_BOT_BUDGET_POSITIVE_CEILING", "0.509")),
+            "negative_ceiling": float(os.getenv("POKER44_BOT_BUDGET_NEGATIVE_CEILING", "0.49")),
+        }
         self.model_path = Path(
             os.getenv(
                 "POKER44_MODEL_PATH",
@@ -99,6 +113,14 @@ class Miner(BaseMinerNeuron):
                 )
 
         bt.logging.info(f"🤖 Poker44 Miner started with backend={self.backend}")
+        if self.bot_budget["enabled"]:
+            bt.logging.info(
+                "Bot-count budget ENABLED (model-external) | "
+                f"max_count={self.bot_budget['max_count']} "
+                f"max_fraction={self.bot_budget['max_fraction']} "
+                f"positive_band=[{self.bot_budget['positive_floor']},{self.bot_budget['positive_ceiling']}] "
+                f"negative_ceiling={self.bot_budget['negative_ceiling']}"
+            )
         runtime_commit = self._repo_head(repo_root)
         runtime_repo_url = self._normalize_repo_url(self._repo_url(repo_root))
         model_metadata = dict(self.predictor.metadata) if self.predictor is not None else {}
@@ -550,6 +572,44 @@ class Miner(BaseMinerNeuron):
 
         return round(cls._clamp01(avg_score + consistency_bonus), 6)
 
+    def _apply_bot_budget(self, scores: List[float]) -> List[float]:
+        """Optional model-external top-K positive cap (off unless env-enabled).
+
+        Caps how many chunks in a batch may be flagged bot to the K most
+        bot-like, pushing those just above 0.5 and everyone else below. Ranking
+        (hence AP) is preserved. Controlled entirely by POKER44_BOT_BUDGET_*
+        env vars; the model artifact is never touched. Mirrors the ``topk_v1``
+        idea but lives outside the model so you can toggle it with a flag.
+        """
+        cfg = self.bot_budget
+        if not scores or not cfg["enabled"]:
+            return scores
+        count = len(scores)
+        mc = cfg["max_count"] if cfg["max_count"] > 0 else count
+        if cfg["max_fraction"] > 0.0:
+            mc = min(mc, max(1, int(count * cfg["max_fraction"])))
+        mc = max(0, min(count, mc))
+        floor = self._clamp01(cfg["positive_floor"])
+        ceiling = self._clamp01(max(floor, cfg["positive_ceiling"]))
+        neg_ceiling = min(self._clamp01(cfg["negative_ceiling"]), floor - 1e-6)
+
+        ranked = sorted(range(count), key=lambda i: scores[i], reverse=True)
+        out = [0.0 for _ in scores]
+        positives, negatives = ranked[:mc], ranked[mc:]
+        if positives:
+            denom = max(1, len(positives) - 1)
+            for rank, idx in enumerate(positives):
+                relative = 1.0 - rank / denom
+                out[idx] = floor + relative * (ceiling - floor)
+        if negatives:
+            neg_scores = [scores[i] for i in negatives]
+            lo, hi = min(neg_scores), max(neg_scores)
+            span = max(hi - lo, 1e-9)
+            for idx in negatives:
+                relative = (scores[idx] - lo) / span
+                out[idx] = max(0.0, min(neg_ceiling, relative * neg_ceiling))
+        return [round(self._clamp01(v), 6) for v in out]
+
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         caller = self._caller_hotkey(synapse)
         chunks = [self._compress_chunk(list(chunk or [])) for chunk in (synapse.chunks or [])]
@@ -588,6 +648,7 @@ class Miner(BaseMinerNeuron):
         else:
             scores = [self.score_chunk(chunk) for chunk in chunks]
         scores = [self._clamp01(score) for score in scores]
+        scores = self._apply_bot_budget(scores)  # no-op unless env-enabled
         synapse.risk_scores = scores
         synapse.predictions = [score >= 0.5 for score in scores]
         synapse.model_manifest = dict(self.model_manifest)
