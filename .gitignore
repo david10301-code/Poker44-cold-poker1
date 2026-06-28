@@ -212,3 +212,6 @@ hands_for_validator/poker_hands_from_rar.json
 
 # Local Weights & Biases runs/artifacts
 wandb/
+
+# Local Claude Code working notes — keep out of GitHub
+CLAUDE.md
