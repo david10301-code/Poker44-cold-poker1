@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from poker44.score.scoring import reward_eval
+from poker44.score.scoring import reward_eval, format_reward_breakdown
 from poker44_ml.inference import Poker44Model
 from training.build_dataset import load_benchmark_examples, resolve_benchmark_paths
 from training.train_model import _enrich_probability_metrics
@@ -51,11 +51,9 @@ def parse_args() -> argparse.Namespace:
         choices=("live", "base", "soft"),
         default="live",
         help=(
-            "How to compute validator_reward for offline comparison. "
-            "live=subnet cliff at FPR>=0.10 (default). "
-            "base=base_score*(1-FPR)^2 (no 0.10 cliff). "
-            "soft=same as base (alias). "
-            "live reward is always kept as validator_reward_live when mode!=live."
+            "Retained for back-compat. Under the live rank-first reward "
+            "(subnet >=0.1.25) there is no FPR penalty to vary, so live/base/"
+            "soft all return the SAME reward = 0.75*AP + 0.25*recall@FPR<=0.05."
         ),
     )
     return parser.parse_args()
@@ -161,6 +159,13 @@ def _print_metric_block(title: str, metrics: dict[str, float], rows: int) -> Non
             print(f"{key}={value}")
         else:
             print(f"{key}={float(value):.6f}")
+    if "validator_ap_score" in metrics:
+        print("reward_breakdown: " + format_reward_breakdown(
+            float(metrics.get("validator_ap_score", 0.0)),
+            float(metrics.get("validator_bot_recall", 0.0)),
+            fpr=float(metrics.get("validator_fpr", 0.0)),
+            reward=float(metrics.get("validator_reward", 0.0)),
+        ))
 
 
 def main() -> None:

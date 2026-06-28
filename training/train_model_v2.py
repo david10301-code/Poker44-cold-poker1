@@ -45,7 +45,7 @@ warnings.filterwarnings(
 
 import numpy as np
 
-from poker44.score.scoring import reward
+from poker44.score.scoring import reward, format_reward_breakdown
 from poker44_ml.chunk_score_metrics import (
     human_bot_prob_bounds,
     print_chunk_score_diagnostics,
@@ -822,6 +822,16 @@ def _validator_metrics(
         ),
         "validator_base_score": float(details.get("base_score", 0.0)),
     }
+
+
+def _reward_breakdown(metrics: Dict[str, float]) -> str:
+    """Reward decomposition line from a ``validator_*`` metrics dict."""
+    return format_reward_breakdown(
+        float(metrics.get("validator_ap_score", 0.0)),
+        float(metrics.get("validator_bot_recall", 0.0)),
+        fpr=float(metrics.get("validator_fpr", 0.0)),
+        reward=float(metrics.get("validator_reward", 0.0)),
+    )
 
 
 def _enrich_metrics(
@@ -1686,6 +1696,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         f"human_prob_max={best['metrics'].get('human_prob_max', 0.0):.4f} "
         f"bot_prob_min={best['metrics'].get('bot_prob_min', 0.0):.4f}"
     )
+    print("  Holdout reward breakdown: " + _reward_breakdown(best["metrics"]))
 
     framework_models = base_names + chunk_names
     metadata: Dict[str, Any] = {
@@ -1818,6 +1829,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     ):
         if key in rt_metrics:
             print(f"  {key}={float(rt_metrics[key]):.6f}")
+    print("  Reward breakdown: " + _reward_breakdown(rt_metrics))
 
     if args.per_source_date:
         source_dates = sorted(
