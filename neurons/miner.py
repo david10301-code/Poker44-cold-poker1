@@ -598,13 +598,6 @@ class Miner(BaseMinerNeuron):
                 scores = await asyncio.to_thread(
                     self.predictor.predict_chunk_scores, chunks
                 )
-                if self.component_debug_logging and hasattr(
-                    self.predictor,
-                    "debug_score_components",
-                ):
-                    component_debug = await asyncio.to_thread(
-                        self.predictor.debug_score_components, chunks
-                    )
             except Exception as err:
                 bt.logging.warning(
                     f"Predictor failure during chunk scoring: {err}. "
@@ -612,6 +605,22 @@ class Miner(BaseMinerNeuron):
                 )
                 backend_used = "heuristic-fallback"
                 scores = [self.score_chunk(chunk) for chunk in chunks]
+            # Diagnostics only: a failure here must NOT clobber the production
+            # scores computed above, so it gets its own guarded block.
+            if (
+                backend_used != "heuristic-fallback"
+                and self.component_debug_logging
+                and hasattr(self.predictor, "debug_score_components")
+            ):
+                try:
+                    component_debug = await asyncio.to_thread(
+                        self.predictor.debug_score_components, chunks
+                    )
+                except Exception as err:
+                    bt.logging.warning(
+                        f"debug_score_components failed (diagnostic only, "
+                        f"scores kept): {err}"
+                    )
         else:
             scores = [self.score_chunk(chunk) for chunk in chunks]
         # Live validator discards the whole response (reward 0) on a count mismatch.

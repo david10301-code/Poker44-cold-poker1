@@ -137,9 +137,12 @@ def load_benchmark_examples(
     seen: set[str] = set()
     for path in path_list:
         for example in _load_labeled_benchmark_file(path, miner_visible=miner_visible):
+            # Key on chunk CONTENT identity (not source_path) so the same chunk
+            # appearing in multiple benchmark files dedupes across files. Keeping
+            # source_path here let cross-file duplicates survive -> train/test
+            # leakage in random splits + date over-weighting.
             key = "|".join(
                 [
-                    str(example.get("source_path", "")),
                     str(example.get("group_hash", "")),
                     str(example.get("group_id", "")),
                     str(example.get("item_index", "")),
