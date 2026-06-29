@@ -1,5 +1,6 @@
 """Poker44 miner with local stacked-model inference and transparent model manifests."""
 
+import asyncio
 import hashlib
 import logging as stdlogging
 import os
@@ -446,6 +447,23 @@ class Miner(BaseMinerNeuron):
     def _clamp01(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
+    @staticmethod
+    def _align_score_count(scores: list, n: int) -> list:
+        """Force exactly one score per chunk.
+
+        The live validator (subnet >=0.1.30) DISCARDS the entire response and
+        scores the cycle 0 if len(scores) != len(chunks). A truncated/extra list
+        (e.g. a partial predictor failure) would zero a whole eval cycle, so we
+        always return exactly ``n`` scores: extras are dropped, shortfalls are
+        padded with 0.0 (treated as human — the safe, non-false-positive value).
+        """
+        scores = list(scores)
+        if len(scores) > n:
+            return scores[:n]
+        if len(scores) < n:
+            return scores + [0.0] * (n - len(scores))
+        return scores
+
     def _compress_chunk(self, chunk: list[dict]) -> list[dict]:
         limit = self.max_hands_per_chunk_eval
         if limit <= 0 or len(chunk) <= limit:
@@ -572,12 +590,21 @@ class Miner(BaseMinerNeuron):
         component_debug = {}
         if self.predictor is not None:
             try:
-                scores = self.predictor.predict_chunk_scores(chunks)
+                # Offload the CPU/GPU-bound inference to a worker thread so the
+                # asyncio event loop stays free to verify/accept other validators'
+                # requests. Running it inline blocks the loop for the whole batch,
+                # which ages incoming nonces past the verification window
+                # (NotVerifiedException: "Nonce is too old") under large snapshots.
+                scores = await asyncio.to_thread(
+                    self.predictor.predict_chunk_scores, chunks
+                )
                 if self.component_debug_logging and hasattr(
                     self.predictor,
                     "debug_score_components",
                 ):
-                    component_debug = self.predictor.debug_score_components(chunks)
+                    component_debug = await asyncio.to_thread(
+                        self.predictor.debug_score_components, chunks
+                    )
             except Exception as err:
                 bt.logging.warning(
                     f"Predictor failure during chunk scoring: {err}. "
@@ -587,6 +614,8 @@ class Miner(BaseMinerNeuron):
                 scores = [self.score_chunk(chunk) for chunk in chunks]
         else:
             scores = [self.score_chunk(chunk) for chunk in chunks]
+        # Live validator discards the whole response (reward 0) on a count mismatch.
+        scores = self._align_score_count(scores, len(chunks))
         scores = [self._clamp01(score) for score in scores]
         synapse.risk_scores = scores
         synapse.predictions = [score >= 0.5 for score in scores]

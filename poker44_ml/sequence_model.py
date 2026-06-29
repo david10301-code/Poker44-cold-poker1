@@ -45,6 +45,7 @@ joblib (state_dict + config) and runs CPU-only by default.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -1086,6 +1087,29 @@ class SequenceModelWrapper:
             "_model_state": self._model_state,
         }
 
+    @staticmethod
+    def _resolve_inference_device(saved_device: str) -> str:
+        """Device to load a saved model onto for INFERENCE.
+
+        Resolution order: explicit env POKER44_SEQUENCE_DEVICE wins; otherwise
+        use the device the model was trained on (saved in the artifact). A CUDA
+        target gracefully falls back to CPU when CUDA is unavailable, so a
+        GPU-trained model never crashes on a CPU-only host. Set
+        POKER44_SEQUENCE_DEVICE=cpu to force CPU inference (e.g. when the GPU is
+        contended by training, or for offline eval on a busy box).
+        """
+        override = os.environ.get("POKER44_SEQUENCE_DEVICE", "").strip()
+        candidate = override or (saved_device or "cpu")
+        if candidate.startswith("cuda"):
+            try:
+                import torch
+
+                if not torch.cuda.is_available():
+                    return "cpu"
+            except Exception:
+                return "cpu"
+        return candidate
+
     def __setstate__(self, state: Dict[str, Any]) -> None:
         self.config = SequenceModelConfig(**state["config"])
         self.n_epochs = int(state["n_epochs"])
@@ -1096,7 +1120,7 @@ class SequenceModelWrapper:
         self.val_fraction = float(state["val_fraction"])
         self.early_stopping_patience = int(state["early_stopping_patience"])
         self.seed = int(state["seed"])
-        self.device = str(state["device"])
+        self.device = self._resolve_inference_device(str(state.get("device", "cpu")))
         self.verbose = bool(state.get("verbose", False))
         self.verbose_metrics = bool(state.get("verbose_metrics", True))
         self._model_state = state.get("_model_state")
