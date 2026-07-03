@@ -11,7 +11,17 @@ from __future__ import annotations
 from typing import Iterable, Sequence
 
 # Substrings that indicate a column is fragile or empty after sanitization.
-_EXCLUDE_SUBSTRINGS: tuple[str, ...] = ()
+# Verified 2026-07-01 (benchmark vs real live-format sample):
+#   * button_action_share / hero_button_same: button_seat is always 0 on BOTH
+#     benchmark and live, so poker44_ml/features.py hard-zeros these (dead const).
+#   * *_bb absolute magnitudes (amount_*_bb, pot_*_bb, starting_stack_*_bb):
+#     2-11 sigma OOD on the sanitized live feed (live pots/bets ~half benchmark
+#     size) -> trees split on benchmark-scale thresholds that collapse on live.
+_EXCLUDE_SUBSTRINGS: tuple[str, ...] = (
+    "button_action_share",
+    "hero_button_same",
+    "_bb",
+)
 
 # At least one must appear in the feature name.
 _INCLUDE_SUBSTRINGS: tuple[str, ...] = (

@@ -111,6 +111,14 @@ fi
 if [[ "$NO_SCORE_LOGIT_TUNE" == "1" ]]; then
   EXTRA_ARGS+=(--no-score-logit-tune)
 fi
+# Meta hard-bot reweighting (targets recall@tight-FPR). Env-gated; defaults to
+# trainer defaults (2.5/2.0) when unset.
+if [[ -n "${META_HARD_BOT_WEIGHT:-}" ]]; then
+  EXTRA_ARGS+=(--meta-hard-bot-weight "$META_HARD_BOT_WEIGHT")
+fi
+if [[ -n "${META_HARD_BOT_GAMMA:-}" ]]; then
+  EXTRA_ARGS+=(--meta-hard-bot-gamma "$META_HARD_BOT_GAMMA")
+fi
 EXTRA_ARGS+=(--calibration-objective "$CALIBRATION_OBJECTIVE")
 EXTRA_ARGS+=(--stack-calibrator "$STACK_CALIBRATOR")
 EXTRA_ARGS+=(--isotonic-calibration-blend "$ISOTONIC_CALIBRATION_BLEND")

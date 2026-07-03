@@ -590,7 +590,7 @@ def _make_base_models(
             (
                 "lightgbm",
                 lgb.LGBMClassifier(
-                    n_estimators=1500,
+                    n_estimators=int(os.getenv("LGB_N_ESTIMATORS", "1500")),
                     learning_rate=0.02,
                     num_leaves=63,
                     min_data_in_leaf=20,
@@ -607,7 +607,7 @@ def _make_base_models(
         )
     if enable_xgb and xgb is not None:
         xgb_kwargs: Dict[str, Any] = dict(
-            n_estimators=1200,
+            n_estimators=int(os.getenv("XGB_N_ESTIMATORS", "1200")),
             learning_rate=0.025,
             max_depth=7,
             min_child_weight=5,
@@ -646,7 +646,7 @@ def _make_base_models(
             (
                 "extratrees",
                 ExtraTreesClassifier(
-                    n_estimators=900,
+                    n_estimators=int(os.getenv("ET_N_ESTIMATORS", "900")),
                     max_depth=12,
                     min_samples_leaf=1,
                     class_weight="balanced_subsample",
@@ -660,7 +660,7 @@ def _make_base_models(
             (
                 "randomforest",
                 RandomForestClassifier(
-                    n_estimators=700,
+                    n_estimators=int(os.getenv("RF_N_ESTIMATORS", "700")),
                     max_depth=12,
                     min_samples_leaf=1,
                     class_weight="balanced_subsample",

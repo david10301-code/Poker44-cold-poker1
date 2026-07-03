@@ -26,6 +26,15 @@ try:
 except ImportError:  # pragma: no cover - optional local-model path.
     Poker44Model = None
 
+try:
+    from poker44_ml import live_capture
+except ImportError:  # pragma: no cover - capture is optional.
+    live_capture = None
+
+# Strong refs to in-flight fire-and-forget capture tasks (loop keeps only weak
+# refs, so without this they can be GC'd mid-write).
+_CAPTURE_TASKS: set = set()
+
 
 class _ScannerNoiseFilter(stdlogging.Filter):
     """Suppress common public-port probe errors emitted before miner routing."""
@@ -629,6 +638,26 @@ class Miner(BaseMinerNeuron):
         synapse.risk_scores = scores
         synapse.predictions = [score >= 0.5 for score in scores]
         synapse.model_manifest = dict(self.model_manifest)
+
+        # Live-query capture (input-only, env-gated POKER44_CAPTURE=1). A live
+        # query has no ground-truth label; used only for benchmark->live OOD
+        # diagnosis. Fire-and-forget in a worker thread so JSON serialization /
+        # file IO never blocks the event loop or adds to response latency.
+        if live_capture is not None and live_capture.enabled():
+            try:
+                _task = asyncio.create_task(
+                    asyncio.to_thread(
+                        live_capture.capture,
+                        chunks,
+                        scores,
+                        getattr(self, "uid", "self"),
+                        caller,
+                    )
+                )
+                _CAPTURE_TASKS.add(_task)
+                _task.add_done_callback(_CAPTURE_TASKS.discard)
+            except Exception:
+                pass
 
         bot_count = sum(1 for prediction in synapse.predictions if prediction)
         human_count = len(scores) - bot_count
