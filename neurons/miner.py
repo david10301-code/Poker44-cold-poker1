@@ -643,15 +643,16 @@ class Miner(BaseMinerNeuron):
         # query has no ground-truth label; used only for benchmark->live OOD
         # diagnosis. Fire-and-forget in a worker thread so JSON serialization /
         # file IO never blocks the event loop or adds to response latency.
-        if live_capture is not None and live_capture.enabled():
+        if live_capture is not None and (live_capture.enabled() or live_capture.batch_enabled()):
             try:
+                def _do_capture(ch, sc, uid, v):
+                    if live_capture.enabled():
+                        live_capture.capture(ch, sc, uid, v)
+                    if live_capture.batch_enabled():
+                        live_capture.capture_batch(ch, sc, uid, v)
                 _task = asyncio.create_task(
                     asyncio.to_thread(
-                        live_capture.capture,
-                        chunks,
-                        scores,
-                        getattr(self, "uid", "self"),
-                        caller,
+                        _do_capture, chunks, scores, getattr(self, "uid", "self"), caller
                     )
                 )
                 _CAPTURE_TASKS.add(_task)

@@ -28,6 +28,11 @@ cd "$(dirname "$0")/.."
 
 OUTPUT="${OUTPUT:-models/poker44_stacked_robust.joblib}"
 BENCHMARK_PATH="${BENCHMARK_PATH:-}"
+# Track whether the caller explicitly set HOLDOUT_SOURCE_DATES (even to "")
+# BEFORE applying the legacy default below -- needed so USE_RELEASED_SPLIT=1
+# without an explicit holdout doesn't silently inherit the stale "2026-05-08"
+# default (which predates the current benchmark files and would error out).
+_HOLDOUT_SOURCE_DATES_EXPLICIT="${HOLDOUT_SOURCE_DATES+1}"
 HOLDOUT_SOURCE_DATES="${HOLDOUT_SOURCE_DATES:-2026-05-08}"
 EXCLUDE_TRAIN_SOURCE_DATES="${EXCLUDE_TRAIN_SOURCE_DATES:-}"
 TARGET_FPR="${TARGET_FPR:-0.04}"
@@ -46,9 +51,28 @@ ROBUST_FEATURES_ONLY="${ROBUST_FEATURES_ONLY:-1}"
 NO_SCORE_REMAP="${NO_SCORE_REMAP:-0}"
 NO_SCORE_LOGIT_TUNE="${NO_SCORE_LOGIT_TUNE:-1}"
 
+if [[ "${USE_RELEASED_SPLIT:-0}" == "1" && -z "$_HOLDOUT_SOURCE_DATES_EXPLICIT" ]]; then
+  # Plain released-split mode: no holdout dates were explicitly requested, so
+  # don't let the legacy HOLDOUT_SOURCE_DATES default drag in an unrelated
+  # (and likely absent-from-the-file) date.
+  HOLDOUT_SOURCE_DATES=""
+fi
+
 EXTRA_ARGS=()
 if [[ -n "$HOLDOUT_SOURCE_DATES" ]]; then
   EXTRA_ARGS+=(--holdout-source-dates "$HOLDOUT_SOURCE_DATES")
+fi
+if [[ "${USE_RELEASED_SPLIT:-0}" == "1" ]]; then
+  # Uses the benchmark's own per-date train/validation split field. Alone:
+  # trains on 'train'-tagged, evals on 'validation'-tagged, across ALL dates
+  # (CAVEAT: train/validation for the same date share ~65-90% identical hand
+  # content, so this is NOT leakage-free the way HOLDOUT_SOURCE_DATES is --
+  # expect a different, not necessarily optimistic, number; see code comment
+  # on _split_released). Combined with HOLDOUT_SOURCE_DATES: trains on ALL
+  # tags from non-holdout dates, evals ONLY on 'validation'-tagged holdout-date
+  # examples, and discards 'train'-tagged holdout-date examples entirely --
+  # this combination IS date-disjoint / leakage-safe.
+  EXTRA_ARGS+=(--use-released-split)
 fi
 if [[ -n "$EXCLUDE_TRAIN_SOURCE_DATES" ]]; then
   EXTRA_ARGS+=(--exclude-train-source-dates "$EXCLUDE_TRAIN_SOURCE_DATES")

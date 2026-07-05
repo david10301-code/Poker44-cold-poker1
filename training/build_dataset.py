@@ -99,6 +99,7 @@ def _load_labeled_benchmark_file(
         source_date = str(group.get("sourceDate") or root.get("sourceDate") or "")
         group_id = str(group.get("chunkId") or f"group_{group_index}")
         group_hash = str(group.get("chunkHash") or "")
+        released_split = str(group.get("split") or "").strip().lower()
         for item_index, (chunk, label) in enumerate(zip(chunks, labels)):
             if not isinstance(chunk, list):
                 continue
@@ -117,6 +118,7 @@ def _load_labeled_benchmark_file(
                     "source_date": source_date,
                     "group_id": group_id,
                     "group_hash": group_hash,
+                    "released_split": released_split,
                     "item_index": item_index,
                     "source_path": str(path),
                     "features": _feature_row(visible_chunk, miner_visible=False),

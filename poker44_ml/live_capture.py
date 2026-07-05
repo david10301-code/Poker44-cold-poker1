@@ -20,6 +20,7 @@ truthfully.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -37,7 +38,35 @@ _DIR = Path(
 )
 _MAX_BYTES = int(os.getenv("POKER44_CAPTURE_MAX_BYTES", str(250 * 1024 * 1024)))
 # Per-process state: resolved output path + a latch once the size cap is hit.
-_state: dict[str, Any] = {"path": None, "full": False}
+# _seen holds chunk-content hashes already on disk: validators resend the SAME
+# daily snapshot every query (measured: 3900 records = 21 unique chunks), so
+# without dedupe the size cap fills with duplicates in hours.
+_state: dict[str, Any] = {"path": None, "full": False, "seen": None}
+
+
+def _chunk_key(chunk: Sequence[dict]) -> str:
+    # Sanitized LIVE hands carry NO hand_id, so we must key on full chunk
+    # CONTENT (deterministic across a snapshot's re-sends, distinct across
+    # different chunks). Keying on hand_id collapsed each 100-chunk snapshot to
+    # one-per-size (~21) and silently dropped the rest.
+    import hashlib
+    blob = json.dumps(chunk, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _load_seen(path: Path) -> set:
+    seen: set = set()
+    try:
+        if path.exists():
+            with open(path) as handle:
+                for line in handle:
+                    try:
+                        seen.add(_chunk_key(json.loads(line).get("chunk") or []))
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return seen
 
 
 def enabled() -> bool:
@@ -64,11 +93,18 @@ def capture(
         if path.exists() and path.stat().st_size >= _MAX_BYTES:
             _state["full"] = True
             return
+        if _state["seen"] is None:
+            _state["seen"] = _load_seen(path)
+        seen: set = _state["seen"]
         ts = round(time.time(), 2)
         vtag = str(validator or "")[:8]
         uid = str(miner_id)
         lines = []
         for chunk, score in zip(chunks, scores):
+            key = _chunk_key(chunk)
+            if key in seen:
+                continue  # duplicate of an already-captured chunk (same snapshot)
+            seen.add(key)
             try:
                 s = round(float(score), 5)
             except (TypeError, ValueError):
@@ -87,4 +123,76 @@ def capture(
                 handle.write(payload)
     except Exception:
         # Capture must NEVER affect serving.
+        pass
+
+
+# ---- batch-level capture: the FULL 100-chunk query saved as ONE record, to a
+# SEPARATE file (batch_<uid>.jsonl). Gated by POKER44_CAPTURE_BATCH=1, deduped by
+# whole-batch content, independent of the per-chunk capture above. ------------
+_batch: dict[str, Any] = {"path": None, "seen": None, "full": False}
+
+
+def batch_enabled() -> bool:
+    return os.getenv("POKER44_CAPTURE_BATCH", "0") == "1"
+
+
+def _batch_key(chunks) -> str:
+    blob = json.dumps(chunks, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _load_batch_seen(path: Path) -> set:
+    seen: set = set()
+    try:
+        if path.exists():
+            with open(path) as handle:
+                for line in handle:
+                    try:
+                        seen.add(_batch_key(json.loads(line).get("chunks") or []))
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return seen
+
+
+def capture_batch(chunks, scores, miner_id, validator) -> None:
+    """Append the whole query batch (all chunks + scores) as one JSON record to
+    <dir>/batch_<uid>.jsonl. One record per UNIQUE snapshot. Never raises."""
+    if not batch_enabled() or _batch["full"] or not chunks:
+        return
+    try:
+        _DIR.mkdir(exist_ok=True)
+        if _batch["path"] is None:
+            _batch["path"] = _DIR / f"batch_{str(miner_id)[:16]}.jsonl"
+        path: Path = _batch["path"]
+        if path.exists() and path.stat().st_size >= _MAX_BYTES:
+            _batch["full"] = True
+            return
+        if _batch["seen"] is None:
+            _batch["seen"] = _load_batch_seen(path)
+        bkey = _batch_key(chunks)
+        if bkey in _batch["seen"]:
+            return  # this exact 100-chunk snapshot already saved
+        _batch["seen"].add(bkey)
+        out_scores = []
+        for s in scores:
+            try:
+                out_scores.append(round(float(s), 6))
+            except (TypeError, ValueError):
+                out_scores.append(None)
+        rec = {
+            "t": round(time.time(), 2),
+            "v": str(validator or "")[:8],
+            "uid": str(miner_id),
+            "n_chunks": len(chunks),
+            "sizes": [len(c) for c in chunks],
+            "scores": out_scores,
+            "chunks": list(chunks),
+        }
+        payload = json.dumps(rec, separators=(",", ":"), default=str) + "\n"
+        with _LOCK:
+            with open(path, "a") as handle:
+                handle.write(payload)
+    except Exception:
         pass

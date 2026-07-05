@@ -118,6 +118,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--holdout-latest-days", type=int, default=2)
     parser.add_argument("--holdout-source-dates", type=str, default=None)
     parser.add_argument(
+        "--use-released-split",
+        action="store_true",
+        help=(
+            "Use the benchmark's own per-date 'split' field (train vs "
+            "validation) instead of a date-based holdout. CAVEAT: for this "
+            "dataset train/validation for the same date share ~65-90% "
+            "identical hand content (recombined into different batches with "
+            "the bot/human twin swapped), so this is NOT a leakage-free "
+            "holdout the way --holdout-source-dates is -- expect optimistic "
+            "metrics relative to a true held-out-date eval."
+        ),
+    )
+    parser.add_argument(
         "--exclude-train-source-dates",
         type=str,
         default=None,
@@ -568,6 +581,154 @@ def _split_temporal(
         "holdout_source_dates": [],
         "excluded_train_source_dates": excluded_train_dates,
         "train_source_dates": [d for d in dates if d not in excluded_train_set],
+    }
+
+
+def _split_released(
+    examples: Sequence[Dict[str, Any]],
+    *,
+    exclude_train_source_dates: str | None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Use the benchmark's own per-date split field (train vs validation)
+    instead of a date-based holdout.
+
+    CAVEAT (verified 2026-07-05): for this dataset, train/validation for the
+    SAME date share ~65-90% identical hand content (the per-date bot/human
+    mirror spans both splits, just recombined into different batches with the
+    label twin swapped). So this is NOT a leakage-free holdout the way
+    HOLDOUT_SOURCE_DATES (a disjoint date range) is -- expect optimistic
+    metrics here relative to a true held-out-date eval.
+    """
+    excluded_train_dates = [
+        item.strip()
+        for item in str(exclude_train_source_dates or "").split(",")
+        if item.strip()
+    ]
+    excluded_train_set = set(excluded_train_dates)
+    dates = sorted(
+        {
+            str(example.get("source_date", "")).strip()
+            for example in examples
+            if str(example.get("source_date", "")).strip()
+        }
+    )
+    train = [e for e in examples if e.get("released_split") == "train"]
+    test = [e for e in examples if e.get("released_split") == "validation"]
+    unlabeled = len(examples) - len(train) - len(test)
+    if unlabeled:
+        raise RuntimeError(
+            f"--use-released-split: {unlabeled}/{len(examples)} examples have no "
+            "released 'split' field (train/validation) -- benchmark file predates "
+            "the split field or was built without it."
+        )
+    if excluded_train_set:
+        train = [
+            e
+            for e in train
+            if str(e.get("source_date", "")).strip() not in excluded_train_set
+        ]
+    return list(train), list(test), {
+        "split_strategy": "released_split",
+        "holdout_source_dates": [],
+        "excluded_train_source_dates": excluded_train_dates,
+        "train_source_dates": [d for d in dates if d not in excluded_train_set],
+    }
+
+
+def _split_released_holdout(
+    examples: Sequence[Dict[str, Any]],
+    *,
+    holdout_source_dates: str | None,
+    exclude_train_source_dates: str | None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Combine --use-released-split with --holdout-source-dates:
+
+      test  = released 'validation'-tagged examples, HOLDOUT dates only.
+      train = ALL examples (both 'train'- and 'validation'-tagged) from every
+              NON-holdout date (maximizes training data, same as plain
+              date-holdout).
+      discarded = 'train'-tagged examples of the HOLDOUT dates -- used
+              NOWHERE. This is deliberate: train/validation for the SAME date
+              share ~65-90% identical hand content (the bot/human mirror spans
+              both tags), so including the holdout dates' 'train'-tagged
+              batches in training would leak eval-adjacent content back in
+              and defeat the point of a date-disjoint holdout.
+
+    Net effect: date-disjoint (leakage-safe) between train and test, AND the
+    test set is restricted to the officially-tagged validation subset of the
+    holdout window (rather than every batch in that window).
+    """
+    requested = [
+        item.strip()
+        for item in str(holdout_source_dates or "").split(",")
+        if item.strip()
+    ]
+    if not requested:
+        raise RuntimeError(
+            "--use-released-split combined with an empty --holdout-source-dates "
+            "has nothing to hold out; pass real dates or drop --holdout-source-dates."
+        )
+    holdout_set = set(requested)
+    excluded_train_dates = [
+        item.strip()
+        for item in str(exclude_train_source_dates or "").split(",")
+        if item.strip()
+    ]
+    excluded_train_set = set(excluded_train_dates)
+    dates = sorted(
+        {
+            str(example.get("source_date", "")).strip()
+            for example in examples
+            if str(example.get("source_date", "")).strip()
+        }
+    )
+    missing = holdout_set - set(dates)
+    if missing:
+        raise RuntimeError(
+            f"--holdout-source-dates has dates not present in the loaded "
+            f"benchmark: {sorted(missing)}. Available dates: "
+            f"{dates[0]}..{dates[-1]} ({len(dates)} dates)."
+        )
+
+    test = [
+        e
+        for e in examples
+        if e.get("released_split") == "validation"
+        and str(e.get("source_date", "")).strip() in holdout_set
+    ]
+    train = [
+        e
+        for e in examples
+        if str(e.get("source_date", "")).strip() not in holdout_set
+    ]
+    discarded = len(examples) - len(train) - len(test)
+    if not test:
+        raise RuntimeError(
+            "--use-released-split + --holdout-source-dates: no released "
+            f"'validation'-tagged examples found for holdout dates {sorted(holdout_set)}."
+        )
+    if excluded_train_set:
+        train = [
+            e
+            for e in train
+            if str(e.get("source_date", "")).strip() not in excluded_train_set
+        ]
+    if (
+        len({int(e["label"]) for e in train}) < 2
+        or len({int(e["label"]) for e in test}) < 2
+    ):
+        raise RuntimeError(
+            "--use-released-split + --holdout-source-dates: train or test set "
+            "does not contain both labels after the split."
+        )
+    return list(train), list(test), {
+        "split_strategy": "released_split_holdout",
+        "holdout_source_dates": sorted(holdout_set),
+        "excluded_train_source_dates": excluded_train_dates,
+        "train_source_dates": [
+            d for d in dates if d not in holdout_set and d not in excluded_train_set
+        ],
+        "discarded_train_tagged_holdout_count": discarded,
     }
 
 
@@ -1188,13 +1349,25 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             f"Benchmark must contain both labels, got {dict(labels_total)}"
         )
 
-    train_examples, test_examples, split_info = _split_temporal(
-        examples,
-        holdout_source_dates=args.holdout_source_dates,
-        holdout_latest_days=args.holdout_latest_days,
-        exclude_train_source_dates=args.exclude_train_source_dates,
-        seed=args.seed,
-    )
+    if args.use_released_split and str(args.holdout_source_dates or "").strip():
+        train_examples, test_examples, split_info = _split_released_holdout(
+            examples,
+            holdout_source_dates=args.holdout_source_dates,
+            exclude_train_source_dates=args.exclude_train_source_dates,
+        )
+    elif args.use_released_split:
+        train_examples, test_examples, split_info = _split_released(
+            examples,
+            exclude_train_source_dates=args.exclude_train_source_dates,
+        )
+    else:
+        train_examples, test_examples, split_info = _split_temporal(
+            examples,
+            holdout_source_dates=args.holdout_source_dates,
+            holdout_latest_days=args.holdout_latest_days,
+            exclude_train_source_dates=args.exclude_train_source_dates,
+            seed=args.seed,
+        )
     train_examples = _restrict_train_latest_dates(
         train_examples,
         int(args.train_latest_days),
