@@ -292,6 +292,7 @@ class Miner(BaseMinerNeuron):
         for relative in (
             "poker44_ml/inference.py",
             "poker44_ml/features.py",
+            "poker44_ml/live_capture.py",
             "poker44_ml/sequence_model.py",
             "poker44_ml/stacked.py",
             "poker44_ml/calibration.py",
