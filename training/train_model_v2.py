@@ -1471,7 +1471,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     ).astype(np.float64)
 
     # OOF predictions for the meta-learner.
-    # n_folds=1 → no internal split: train on ALL fit_examples, predict on
+    # n_folds<=1 → no internal split: train on ALL fit_examples, predict on
     #             cal_examples to get meta/calibration scores.
     # n_folds≥2 → standard k-fold OOF on fit_examples.
     n_folds = max(1, int(args.n_folds))
