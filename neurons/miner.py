@@ -289,7 +289,8 @@ class Miner(BaseMinerNeuron):
         files = [Path(__file__).resolve()]
         if not has_predictor:
             return files
-        for relative in (
+        # Serving path: code that actually runs when scoring a chunk.
+        serving = (
             "poker44_ml/inference.py",
             "poker44_ml/features.py",
             "poker44_ml/live_capture.py",
@@ -297,7 +298,14 @@ class Miner(BaseMinerNeuron):
             "poker44_ml/stacked.py",
             "poker44_ml/calibration.py",
             "poker44/validator/payload_view.py",
-        ):
+        )
+        # Training recipe: not executed at serve time, but included so the
+        # published implementation hash also attests how the artifact was
+        # produced (reproducibility for the audit lane).
+        training = (
+            "scripts/train_stacked_v2.sh",
+        )
+        for relative in (*serving, *training):
             candidate = repo_root / relative
             if candidate.exists():
                 files.append(candidate)
