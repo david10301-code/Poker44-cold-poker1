@@ -89,6 +89,30 @@ class Miner(BaseMinerNeuron):
             os.getenv("POKER44_LOG_SCORE_ARRAYS", "1").strip().lower()
             in {"1", "true", "yes", "on"}
         )
+        # Model-external true-rank batch remap (opt-in, default OFF via
+        # POKER44_BATCH_RANK). Re-ranks each validator batch so ~target_fraction
+        # crosses 0.5 -- per-batch stable and model-agnostic (immune to each
+        # model's score scale), which fixes BOTH over-crossing (high FPR@0.5) and
+        # under-crossing (zero-gate) under the 0.1.34 reward without retraining.
+        # CAVEAT/FLAG: assumes ~balanced batches; on a skewed batch it forces the
+        # target fraction across 0.5 regardless of the true bot rate.
+        self.batch_rank_enabled = (
+            os.getenv("POKER44_BATCH_RANK", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.batch_rank_target_fraction = min(
+            0.99, max(0.01, float(os.getenv("POKER44_BATCH_RANK_TARGET_FRACTION", "0.5") or 0.5))
+        )
+        self.batch_rank_span = min(
+            0.98, max(0.10, float(os.getenv("POKER44_BATCH_RANK_SPAN", "0.8") or 0.8))
+        )
+        if self.batch_rank_enabled:
+            bt.logging.info(
+                "Batch-rank remap ENABLED (model-external, true-rank) | "
+                f"target_fraction={self.batch_rank_target_fraction} "
+                f"span={self.batch_rank_span} "
+                "(rank-preserving: AP/recall unchanged; sets the 0.5 crossing)"
+            )
         self.model_path = Path(
             os.getenv(
                 "POKER44_MODEL_PATH",
@@ -586,6 +610,28 @@ class Miner(BaseMinerNeuron):
 
         return round(cls._clamp01(avg_score + consistency_bonus), 6)
 
+    def _apply_batch_rank(self, scores: List[float]) -> List[float]:
+        """True-rank per-batch remap of one validator batch's scores.
+
+        Maps each chunk to its within-batch rank in [0,1] (argsort-of-argsort),
+        then into a band so exactly the top ``target_fraction`` cross 0.5 every
+        batch. Rank-based -> preserves the model's ordering (AP and recall@FPR
+        are unchanged) and is immune to score scale (works identically across
+        models). Per-batch stable, unlike a fixed absolute threshold.
+        """
+        n = len(scores)
+        if n <= 1:
+            return scores
+        # stable true rank in [0,1]: sort indices by (score, index), position=rank
+        order = sorted(range(n), key=lambda i: (scores[i], i))
+        rank = [0.0] * n
+        for pos, i in enumerate(order):
+            rank[i] = pos / (n - 1)
+        frac = self.batch_rank_target_fraction
+        span = self.batch_rank_span
+        lo = 0.5 - (1.0 - frac) * span  # -> output(rank=1-frac) == 0.5
+        return [self._clamp01(lo + r * span) for r in rank]
+
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         caller = self._caller_hotkey(synapse)
         chunks = [self._compress_chunk(list(chunk or [])) for chunk in (synapse.chunks or [])]
@@ -644,6 +690,8 @@ class Miner(BaseMinerNeuron):
         # Live validator discards the whole response (reward 0) on a count mismatch.
         scores = self._align_score_count(scores, len(chunks))
         scores = [self._clamp01(score) for score in scores]
+        if self.batch_rank_enabled and len(scores) >= 4:
+            scores = self._apply_batch_rank(scores)
         synapse.risk_scores = scores
         synapse.predictions = [score >= 0.5 for score in scores]
         synapse.model_manifest = dict(self.model_manifest)

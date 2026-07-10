@@ -280,6 +280,24 @@ def parse_args() -> argparse.Namespace:
         help="Do not tune the legacy high-band score_remap on the calibration split.",
     )
     parser.add_argument(
+        "--fixed-score-remap-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, use a FIXED threshold_logit score_remap with this threshold "
+            "(the 0.5 crossing lands where the calibrated score equals this value) "
+            "instead of fitting one on the calibration split. Robust to the "
+            "benchmark->live date shift that makes fitted thresholds fragile under "
+            "the 0.1.34 reward. Typical: 0.70."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-score-remap-temperature",
+        type=float,
+        default=0.25,
+        help="Temperature for the fixed score_remap (only used with --fixed-score-remap-threshold).",
+    )
+    parser.add_argument(
         "--score-remap-temperature-grid",
         type=str,
         default="0.12,0.18,0.25,0.35,0.50,0.65,0.85,1.0,1.25",
@@ -1038,8 +1056,15 @@ def _calibration_objective_key(
     objective = str(objective).strip().lower()
     if objective == "recall":
         return (recall, bot_min, val_reward)
-    if objective == "reward":
-        return (val_reward, ap, recall)
+    if objective in ("reward", "threshold_sanity"):
+        # 0.1.34-aware: primary = live reward (now includes the 0.5
+        # threshold_sanity term). Break reward ties toward MORE bot chunks
+        # crossing 0.5 (recall_at_0_5) -> pushes the remap threshold DOWN, which
+        # is robust to the benchmark->live score shift (bots keep crossing even
+        # when live scores compress). ap is rank-invariant so it never breaks a
+        # tie; recall_at_0_5 does.
+        recall_at_0_5 = float(metrics.get("recall_at_0_5", 0.0))
+        return (val_reward, recall_at_0_5, recall)
     return (ap, recall, val_reward)
 
 
@@ -1055,8 +1080,13 @@ def _is_better_calibration_candidate(
         return True
     if not prefer_smooth_remap:
         return False
-    # AP (or reward/recall primary) ties: pick duller remap = higher temperature.
-    if abs(key[0] - best_key[0]) <= 1e-4 and temperature > best_temperature + 1e-9:
+    # Only when the FULL objective key ties (not just the primary) does the
+    # smoothness tie-break apply -- otherwise "prefer higher temperature" would
+    # override the recall_at_0_5 secondary and re-collapse scores toward 0.5.
+    if (
+        all(abs(a - b) <= 1e-4 for a, b in zip(key, best_key))
+        and temperature > best_temperature + 1e-9
+    ):
         return True
     return False
 
@@ -1066,7 +1096,13 @@ def _passes_calibration_constraints(
 ) -> bool:
     if metrics.get("validator_fpr", 1.0) >= max_validator_fpr - 1e-9:
         return False
-    if metrics.get("human_prob_max", 1.0) > 0.495:
+    # 0.1.34 threshold_sanity: humans may cross 0.5 up to FPR 0.10 (was: exactly
+    # 0, via human_prob_max <= 0.495 -- which forced the remap threshold above
+    # every human score and collapsed live scores below 0.5). Bots MUST cross
+    # 0.5, else the reward zero-gates.
+    if metrics.get("fpr_at_0_5", 1.0) > 0.10 + 1e-9:
+        return False
+    if metrics.get("recall_at_0_5", 0.0) <= 0.0:
         return False
     return True
 
@@ -1736,15 +1772,40 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             [int(example["label"]) for example in cal_examples], dtype=np.int64
         )
         cal_raw = _stacked_raw_scores(cal_examples)
-        score_remap, cal_metrics = _select_score_remap_for_validator_reward(
-            y_cal,
-            cal_raw,
-            target_fpr=float(args.target_fpr),
-            max_validator_fpr=float(args.max_validator_fpr),
-            calibration_objective=cal_objective,
-            temperature_grid=score_remap_temp_grid,
-            prefer_smooth_remap=prefer_smooth_remap,
-        )
+        _fixed_remap_thr = float(getattr(args, "fixed_score_remap_threshold", 0.0) or 0.0)
+        if _fixed_remap_thr > 0.0:
+            # FIXED (not fitted) threshold_logit remap: place the 0.5 crossing at
+            # a constant calibrated-score value. Cal-fit thresholds don't
+            # generalize across the day-to-day v1.13 distribution shift (verified),
+            # so under the 0.1.34 reward a fixed upward crossing is the robust
+            # choice: bots stay above 0.5, humans below, no zero-gate.
+            score_remap = {
+                "kind": "threshold_logit_v1",
+                "threshold": _fixed_remap_thr,
+                "temperature": float(
+                    getattr(args, "fixed_score_remap_temperature", 0.25) or 0.25
+                ),
+                "fixed": True,
+            }
+            cal_metrics = _enrich_metrics(
+                y_cal.tolist(),
+                _apply_score_remap_np(cal_raw, score_remap).tolist(),
+            )
+            print(
+                "score_remap FIXED (not fitted, robust to date-shift): "
+                f"threshold={score_remap['threshold']:.4f} "
+                f"temperature={score_remap['temperature']:.4f}"
+            )
+        else:
+            score_remap, cal_metrics = _select_score_remap_for_validator_reward(
+                y_cal,
+                cal_raw,
+                target_fpr=float(args.target_fpr),
+                max_validator_fpr=float(args.max_validator_fpr),
+                calibration_objective=cal_objective,
+                temperature_grid=score_remap_temp_grid,
+                prefer_smooth_remap=prefer_smooth_remap,
+            )
         cal_raw_bounds = human_bot_prob_bounds(y_cal.tolist(), cal_raw.tolist())
         cal_remap_line = ""
         if score_remap:
@@ -1773,7 +1834,23 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             f"cal_recall={cal_metrics.get('validator_bot_recall', 0.0):.4f}"
         )
     elif use_score_remap:
-        print("WARN: no calibration split; score_remap disabled.")
+        _fixed_remap_thr = float(getattr(args, "fixed_score_remap_threshold", 0.0) or 0.0)
+        if _fixed_remap_thr > 0.0:
+            score_remap = {
+                "kind": "threshold_logit_v1",
+                "threshold": _fixed_remap_thr,
+                "temperature": float(
+                    getattr(args, "fixed_score_remap_temperature", 0.25) or 0.25
+                ),
+                "fixed": True,
+            }
+            print(
+                "score_remap FIXED (not fitted, no cal split needed): "
+                f"threshold={score_remap['threshold']:.4f} "
+                f"temperature={score_remap['temperature']:.4f}"
+            )
+        else:
+            print("WARN: no calibration split; score_remap disabled.")
     else:
         print("score_remap disabled (--no-score-remap).")
 

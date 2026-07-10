@@ -132,6 +132,12 @@ fi
 if [[ "${NO_SCORE_REMAP_PREFER_SMOOTH:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--no-score-remap-prefer-smooth)
 fi
+# Fixed (not fitted) score_remap threshold -- robust to the benchmark->live date
+# shift under the 0.1.34 reward. Needs NO_SCORE_REMAP=0. Typical: 0.70.
+if [[ -n "${FIXED_SCORE_REMAP_THRESHOLD:-}" ]]; then
+  EXTRA_ARGS+=(--fixed-score-remap-threshold "$FIXED_SCORE_REMAP_THRESHOLD")
+  EXTRA_ARGS+=(--fixed-score-remap-temperature "${FIXED_SCORE_REMAP_TEMPERATURE:-0.25}")
+fi
 if [[ "$NO_SCORE_LOGIT_TUNE" == "1" ]]; then
   EXTRA_ARGS+=(--no-score-logit-tune)
 fi
