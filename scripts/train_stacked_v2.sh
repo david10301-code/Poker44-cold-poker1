@@ -112,7 +112,7 @@ if [[ "${ENABLE_SEQUENCE:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--sequence-hand-layers "${SEQUENCE_HAND_LAYERS:-1}")
   EXTRA_ARGS+=(--sequence-max-hands "${SEQUENCE_MAX_HANDS:-64}")
   EXTRA_ARGS+=(--sequence-max-actions "${SEQUENCE_MAX_ACTIONS:-12}")
-  EXTRA_ARGS+=(--sequence-dropout "${SEQUENCE_DROPOUT:-0.1}")
+  EXTRA_ARGS+=(--sequence-dropout "${SEQUENCE_DROPOUT:-0.15}")
   EXTRA_ARGS+=(--sequence-device "${SEQUENCE_DEVICE:-cuda}")
 fi
 if [[ "${SEQUENCE_ONLY:-0}" == "1" ]]; then
