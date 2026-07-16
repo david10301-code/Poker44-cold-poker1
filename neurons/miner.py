@@ -104,7 +104,7 @@ class Miner(BaseMinerNeuron):
             0.99, max(0.01, float(os.getenv("POKER44_BATCH_RANK_TARGET_FRACTION", "0.5") or 0.5))
         )
         self.batch_rank_span = min(
-            0.98, max(0.10, float(os.getenv("POKER44_BATCH_RANK_SPAN", "0.8") or 0.8))
+            0.98, max(0.10, float(os.getenv("POKER44_BATCH_RANK_SPAN", "0.8") or 0.71))
         )
         if self.batch_rank_enabled:
             bt.logging.info(

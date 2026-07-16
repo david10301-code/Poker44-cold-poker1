@@ -1,6 +1,6 @@
 """V2 training pipeline: stacked LGB/XGB/CatBoost/ExtraTrees/RandomForest.
 
-Beats the current ``train_model.py`` weighted-mean blend by:
+Beats the current ``train_model.py`` by:
 
 * Out-of-fold (K-fold) **stacking** with a logistic-regression meta-learner,
   trained against the same labels.
@@ -933,6 +933,21 @@ def _hard_bot_meta_weights(
 # ---------- feature selection ----------------------------------------------
 
 
+def _load_keep_only_names(path: str) -> list[str]:
+    """Read a feature allowlist file (one name per line; ``#`` comments ok)."""
+    names: list[str] = []
+    seen: set[str] = set()
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            name = line.split("#", 1)[0].strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+    if not names:
+        raise RuntimeError(f"ROBUST_KEEP_ONLY_FILE={path} contained no feature names.")
+    return names
+
+
 def _top_k_feature_indices(
     x: np.ndarray, y: np.ndarray, feature_names: Sequence[str], k: int, *, seed: int
 ) -> np.ndarray:
@@ -1426,7 +1441,26 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     train_examples = fit_examples
 
     all_feature_names = sorted(examples[0]["features"].keys())
-    if args.robust_features_only:
+    keep_only_path = os.getenv("ROBUST_KEEP_ONLY_FILE", "").strip()
+    if keep_only_path:
+        allowed = _load_keep_only_names(keep_only_path)
+        available = set(all_feature_names)
+        feature_names = sorted(name for name in allowed if name in available)
+        missing = sorted(name for name in allowed if name not in available)
+        if len(feature_names) < 16:
+            raise RuntimeError(
+                f"ROBUST_KEEP_ONLY_FILE={keep_only_path} matched only "
+                f"{len(feature_names)} of {len(all_feature_names)} available "
+                "features; check the allowlist file and dataset schema."
+            )
+        print(
+            f"Keep-only feature filter ({keep_only_path}): "
+            f"kept {len(feature_names)}/{len(all_feature_names)} "
+            f"(file listed {len(allowed)}, {len(missing)} not in dataset)"
+        )
+        if missing:
+            print(f"  missing sample: {missing[:12]}")
+    elif args.robust_features_only:
         feature_names = filter_robust_feature_names(all_feature_names)
         summary = summarize_robust_filter(all_feature_names, feature_names)
         if len(feature_names) < 16:
